@@ -285,6 +285,38 @@ mod tests {
         assert_eq!(classify("file://elsewhere/x.html"), None);
     }
 
+    /// Hands a real URL to the real browser.
+    ///
+    /// Everything else here runs with launching compiled out, so this is the only proof
+    /// the command line itself is right. Point it at a listener you control and check the
+    /// request arrives with its query string intact — an `&` is exactly what a shell in
+    /// between would have eaten.
+    #[test]
+    #[ignore = "opens the default browser; run with CST_LINKS_LIVE_URL=<url>"]
+    fn a_web_link_really_reaches_the_browser() {
+        let Ok(url) = std::env::var("CST_LINKS_LIVE_URL") else {
+            return;
+        };
+        let target = classify(&url).expect("a web link");
+        assert!(matches!(target, Target::Web(_)));
+        open(&target).expect("the browser should start");
+    }
+
+    /// Hands a real file to the real file manager.
+    ///
+    /// Aim it at a script that leaves a marker behind if it ever runs: the point of
+    /// revealing rather than opening is that the marker never appears.
+    #[test]
+    #[ignore = "opens a file manager window; run with CST_LINKS_LIVE_FILE=<path>"]
+    fn a_file_link_really_reveals_the_file() {
+        let Ok(path) = std::env::var("CST_LINKS_LIVE_FILE") else {
+            return;
+        };
+        let target = classify(&path).expect("a file link");
+        assert!(matches!(target, Target::File(_)));
+        open(&target).expect("the file manager should start");
+    }
+
     #[test]
     fn malformed_percent_escapes_are_refused() {
         assert_eq!(classify("file:///C:/a%2"), None);
