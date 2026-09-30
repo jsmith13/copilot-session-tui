@@ -11,6 +11,7 @@ mod github;
 mod hook_plugin;
 mod host_terminal;
 mod input;
+mod links;
 mod mux;
 mod mux_input;
 mod notifications;

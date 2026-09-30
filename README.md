@@ -480,6 +480,13 @@ Mouse tracking, image-paste triggers, OSC 52 clipboard-copy requests, and OSC 9;
 states are forwarded through the mux so Copilot retains the outer terminal's scrolling,
 paste, copy, and Windows Terminal tab-spinner behavior.
 
+**Ctrl+click a link** in a pane to open it. Links whose address is hidden behind text — "Open
+the report", say — work too; outside CST your terminal would open those, but a nested
+terminal cannot hand them on, so CST follows them itself. What a click may do is deliberately
+narrow, because an agent can print a link to anything: web links open in your browser, a
+link to a file shows it selected in its folder rather than running it, and every other kind
+of link is refused.
+
 When a background Copilot pane transitions from working to complete (or rings the terminal
 bell), CST marks its tab `●` — a finished turn nobody has read yet — and prepends `?` to
 the outer Windows Terminal tab title. That ordinary completion marker is acknowledged when

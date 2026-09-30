@@ -537,6 +537,13 @@ impl Pane {
             .flatten()
     }
 
+    /// Where the hyperlink under an outer-terminal coordinate points, if there is one.
+    pub fn link_at(&self, column: u16, row: u16) -> Option<String> {
+        let (row, column) = self.viewport.cell_coordinates(column, row)?;
+        let parser = self.parser.lock().ok()?;
+        parser.callbacks().link_at(parser.screen(), row, column)
+    }
+
     /// Every `#1234` currently on the pane's screen.
     ///
     /// Used to look up what those numbers point at, so they can be decorated.

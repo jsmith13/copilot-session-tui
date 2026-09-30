@@ -141,6 +141,21 @@ pub fn handle_attached_event(app: &mut App, event: Event) {
     }
 
     if let Event::Mouse(mouse) = &event {
+        // Ctrl+click, as in any terminal. A plain click still belongs to the child, which
+        // uses it for its own interface.
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && mouse.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            let link = app
+                .mux
+                .as_ref()
+                .and_then(|mux| mux.focused_pane())
+                .and_then(|pane| pane.link_at(mouse.column, mouse.row));
+            if let Some(link) = link {
+                app.open_link(&link);
+                return;
+            }
+        }
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             let reference = app
                 .mux
@@ -2933,6 +2948,85 @@ mod tests {
             turns >= 3,
             "three notices cannot be delivered in fewer than three turns"
         );
+    }
+
+    /// Put a named link on an attached pane's screen, placed away from the terminal origin.
+    ///
+    /// The pane is moved to (2, 3) so a test clicking at the link's text also proves the
+    /// outer-to-pane coordinate translation — clicking the right cell of the wrong
+    /// coordinate system is exactly the kind of mistake that passes at (0, 0).
+    fn app_showing_a_link(session: &str, target: &str) -> App {
+        let mut app = attached_mux_app(session);
+        let pane = app.mux.as_mut().unwrap().pane_mut(1).unwrap();
+        pane.resize_at(2, 3, 24, 80).unwrap();
+        // The child is a real process, and ConPTY clears the screen as it starts. Let that
+        // land first, or it can wipe the link between drawing it and clicking it.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        pane.feed_synthetic(
+            format!("\x1b[1;1Hsee \x1b]8;;{target}\x1b\\Open the local gallery\x1b]8;;\x1b\\.")
+                .as_bytes(),
+        );
+        app
+    }
+
+    fn mouse_down(column: u16, row: u16, modifiers: KeyModifiers) -> Event {
+        Event::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers,
+        })
+    }
+
+    /// The report, through the real input path.
+    ///
+    /// A coworker clicked "Open the local gallery" and nothing happened. The link's target
+    /// lived only in the escape sequence, which CST used to drop, so no click could ever
+    /// have reached it.
+    #[test]
+    fn ctrl_clicking_a_named_link_opens_where_it_points() {
+        let mut app = app_showing_a_link("links", "file:///D:/gallery/index.html");
+        // The link's text starts at pane column 4, which is outer column 2 + 4.
+        let on_link = 2 + 10;
+
+        handle_attached_event(&mut app, mouse_down(on_link, 3, KeyModifiers::NONE));
+        assert!(
+            app.opened_links.is_empty(),
+            "a plain click still belongs to Copilot, which uses it for its own interface"
+        );
+
+        handle_attached_event(&mut app, mouse_down(on_link, 3, KeyModifiers::CONTROL));
+        assert_eq!(app.opened_links.len(), 1, "got: {:?}", app.status_message);
+        assert!(matches!(
+            &app.opened_links[0],
+            crate::links::Target::File(_)
+        ));
+
+        handle_attached_event(&mut app, mouse_down(2 + 26, 3, KeyModifiers::CONTROL));
+        assert_eq!(
+            app.opened_links.len(),
+            1,
+            "the full stop after the link is not part of it"
+        );
+        let _ = app.mux.as_mut().unwrap().shutdown();
+    }
+
+    /// A link to a handler that acts on a click is shown, and refused when clicked.
+    #[test]
+    fn a_link_to_anything_but_the_web_or_a_file_is_refused() {
+        let mut app = app_showing_a_link("refused", "ms-settings:privacy");
+
+        handle_attached_event(&mut app, mouse_down(2 + 10, 3, KeyModifiers::CONTROL));
+
+        assert!(app.opened_links.is_empty());
+        assert!(
+            app.status_message
+                .as_deref()
+                .is_some_and(|message| message.starts_with("Not opened")),
+            "the user is told why nothing happened, got: {:?}",
+            app.status_message
+        );
+        let _ = app.mux.as_mut().unwrap().shutdown();
     }
 
     fn send_prefix_command(app: &mut App, command: char) {

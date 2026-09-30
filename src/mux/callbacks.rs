@@ -27,6 +27,45 @@ pub struct PaneCallbacks {
     signals: Vec<PaneSignalEvent>,
     terminal_light_mode: Option<bool>,
     theme_updates_requested: bool,
+    /// A hyperlink the child has started and not yet closed.
+    open_link: Option<OpenLink>,
+    /// Hyperlinks the child has drawn, newest last.
+    ///
+    /// Kept here because `vt100` has no notion of a hyperlink: its cells hold text and
+    /// style only, and OSC 8 falls through to this callback. Without this a link reached
+    /// the pane as underlined text and nothing else, so the outer terminal had nothing to
+    /// open — only a URL spelled out in full could be clicked, and only because Windows
+    /// Terminal recognises those by sight.
+    links: std::collections::VecDeque<LinkSpan>,
+}
+
+/// How many links are remembered at once.
+///
+/// Comfortably more than fit on a screen. The child redraws the same links over and over
+/// and each redraw replaces its earlier copy, so this only bounds the leftovers of links
+/// that have scrolled away or been drawn over.
+const MAX_LINKS: usize = 256;
+
+struct OpenLink {
+    start: (u16, u16),
+    alternate: bool,
+    target: String,
+}
+
+/// One hyperlink as drawn: where it sat, what it read, and where it pointed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LinkSpan {
+    /// First cell, as (row, column).
+    start: (u16, u16),
+    /// One past the last cell, as (row, column).
+    end: (u16, u16),
+    alternate: bool,
+    /// The text those cells held when the link was drawn.
+    ///
+    /// Checked again at click time. The child redraws freely, and a click must never
+    /// open a link that has since been painted over with something else.
+    text: String,
+    target: String,
 }
 
 impl PaneCallbacks {
@@ -44,6 +83,77 @@ impl PaneCallbacks {
             signals: Vec::new(),
             terminal_light_mode,
             theme_updates_requested: false,
+            open_link: None,
+            links: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Where the link under a cell points, if that cell still shows the link.
+    ///
+    /// Takes `(row, column)` in screen cells. Returns nothing while the pane is scrolled
+    /// back, because links are recorded against the live screen and would line up with
+    /// the wrong rows of history.
+    pub fn link_at(&self, screen: &vt100::Screen, row: u16, column: u16) -> Option<String> {
+        if screen.scrollback() > 0 {
+            return None;
+        }
+        let alternate = screen.alternate_screen();
+        self.links
+            .iter()
+            .rev()
+            .find(|link| {
+                link.alternate == alternate
+                    && (row, column) >= link.start
+                    && (row, column) < link.end
+                    && screen.contents_between(link.start.0, link.start.1, link.end.0, link.end.1)
+                        == link.text
+            })
+            .map(|link| link.target.clone())
+    }
+
+    /// Follow an OSC 8 sequence: `8 ; params ; target` opens a link, an empty target
+    /// closes it.
+    fn hyperlink(&mut self, screen: &vt100::Screen, params: &[&[u8]]) {
+        // A target can itself contain `;`, which the parser has already split on, so
+        // everything after the parameters field is put back together.
+        let target = params.get(2..).unwrap_or_default().join(&b';');
+        let target = String::from_utf8_lossy(&target).into_owned();
+        let here = screen.cursor_position();
+        // Whatever was open ends here — either this sequence closes it, or a new link
+        // starts without the old one having been closed, which some programs do.
+        if let Some(open) = self.open_link.take() {
+            self.record_link(screen, open, here);
+        }
+        if !target.is_empty() {
+            self.open_link = Some(OpenLink {
+                start: here,
+                alternate: screen.alternate_screen(),
+                target,
+            });
+        }
+    }
+
+    fn record_link(&mut self, screen: &vt100::Screen, open: OpenLink, end: (u16, u16)) {
+        if end <= open.start || open.alternate != screen.alternate_screen() {
+            return;
+        }
+        let text = screen.contents_between(open.start.0, open.start.1, end.0, end.1);
+        if text.trim().is_empty() {
+            return;
+        }
+        // The child redraws its view constantly and sends the same link each time. The
+        // newer copy replaces the older one rather than piling up behind it.
+        self.links
+            .retain(|link| link.start != open.start || link.alternate != open.alternate);
+        self.links.push_back(LinkSpan {
+            start: open.start,
+            end,
+            alternate: open.alternate,
+            text,
+            target: open.target,
+        });
+        while self.links.len() > MAX_LINKS {
+            self.links.pop_front();
         }
     }
 
@@ -107,7 +217,13 @@ impl vt100::Callbacks for PaneCallbacks {
         }
     }
 
-    fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
+    fn unhandled_osc(&mut self, screen: &mut vt100::Screen, params: &[&[u8]]) {
+        if params.first() == Some(&&b"8"[..]) {
+            // Recorded, never forwarded. Passing a child's OSC through to the outer
+            // terminal is exactly what the progress passthrough below refuses to do.
+            self.hyperlink(screen, params);
+            return;
+        }
         if let Some(progress) = crate::host_terminal::progress_state(params) {
             self.signals.push(PaneSignalEvent::Progress(progress));
         }
@@ -303,6 +419,123 @@ mod tests {
             )]
         );
         assert!(parser.callbacks_mut().take_signals().events.is_empty());
+    }
+
+    fn link_under(parser: &vt100::Parser<PaneCallbacks>, row: u16, column: u16) -> Option<String> {
+        parser.callbacks().link_at(parser.screen(), row, column)
+    }
+
+    /// The report: links drawn as text with nothing behind them.
+    ///
+    /// A named link carries its target in the escape sequence, not the text, so once the
+    /// sequence was dropped there was nothing left for anyone to open.
+    #[test]
+    fn a_named_link_is_found_under_its_text_and_nowhere_else() {
+        let (mut parser, _, events) = parser_with_replies(false);
+        parser.process(
+            b"see \x1b]8;;file:///D:/gallery/index.html\x1b\\Open the local gallery\x1b]8;;\x1b\\.",
+        );
+
+        let target = Some("file:///D:/gallery/index.html".to_string());
+        assert_eq!(link_under(&parser, 0, 4), target, "its first letter");
+        assert_eq!(link_under(&parser, 0, 25), target, "its last letter");
+        assert_eq!(link_under(&parser, 0, 3), None, "the space before it");
+        assert_eq!(link_under(&parser, 0, 26), None, "the full stop after it");
+        assert!(
+            events.try_recv().is_err(),
+            "recorded, never passed on to the outer terminal"
+        );
+    }
+
+    #[test]
+    fn a_link_drawn_over_is_no_longer_there_to_click() {
+        let (mut parser, _, _) = parser_with_replies(false);
+        parser.process(b"\x1b]8;;https://a.example\x1b\\first\x1b]8;;\x1b\\");
+        assert!(link_under(&parser, 0, 0).is_some());
+
+        // The child redraws that line with something else, and no link this time.
+        parser.process(b"\x1b[1;1Hplain");
+
+        assert_eq!(
+            link_under(&parser, 0, 0),
+            None,
+            "a click must never open a link that is no longer on screen"
+        );
+    }
+
+    #[test]
+    fn a_target_containing_semicolons_arrives_whole() {
+        // The parser splits OSC parameters on `;`, which a URL may legitimately contain.
+        let (mut parser, _, _) = parser_with_replies(false);
+        parser.process(b"\x1b]8;;https://example.com/a;b=1;c\x1b\\x\x1b]8;;\x1b\\");
+
+        assert_eq!(
+            link_under(&parser, 0, 0).as_deref(),
+            Some("https://example.com/a;b=1;c")
+        );
+    }
+
+    #[test]
+    fn a_link_that_wraps_can_be_clicked_on_either_row() {
+        let (mut parser, _, _) = parser_with_replies(false);
+        // Eight letters starting four from the right edge: half on each row.
+        parser.process(b"\x1b[1;77H\x1b]8;;https://w.example\x1b\\abcdefgh\x1b]8;;\x1b\\");
+
+        assert!(link_under(&parser, 0, 76).is_some(), "the first half");
+        assert!(link_under(&parser, 1, 3).is_some(), "the second half");
+        assert_eq!(link_under(&parser, 1, 4), None, "just past the end");
+    }
+
+    #[test]
+    fn a_link_redrawn_every_frame_is_remembered_once() {
+        // Copilot repaints its whole view constantly. Every repaint resends the links.
+        let (mut parser, _, _) = parser_with_replies(false);
+        for _ in 0..1000 {
+            parser.process(b"\x1b[1;1H\x1b]8;;https://a.example\x1b\\link\x1b]8;;\x1b\\");
+        }
+        assert_eq!(parser.callbacks().links.len(), 1);
+    }
+
+    #[test]
+    fn a_new_link_closes_one_left_open() {
+        // Some programs start the next link without closing the last.
+        let (mut parser, _, _) = parser_with_replies(false);
+        parser.process(
+            b"\x1b]8;;https://a.example\x1b\\one \x1b]8;;https://b.example\x1b\\two\x1b]8;;\x1b\\",
+        );
+
+        assert_eq!(
+            link_under(&parser, 0, 0).as_deref(),
+            Some("https://a.example")
+        );
+        assert_eq!(
+            link_under(&parser, 0, 4).as_deref(),
+            Some("https://b.example")
+        );
+    }
+
+    #[test]
+    fn nothing_resolves_while_scrolled_back_through_history() {
+        // Links are recorded against the live screen. Scrolled back, the same cells show
+        // older rows, and a click would open whatever link used to sit there.
+        let (tx, _) = mpsc::channel();
+        let (event_tx, _) = mpsc::channel();
+        let mut parser = vt100::Parser::new_with_callbacks(
+            24,
+            80,
+            100,
+            PaneCallbacks::new(7, tx, event_tx, Some(false)),
+        );
+        for line in 0..40 {
+            parser.process(format!("line {line}\r\n").as_bytes());
+        }
+        parser.process(b"\x1b]8;;https://a.example\x1b\\link\x1b]8;;\x1b\\");
+        let (row, _) = parser.screen().cursor_position();
+        assert!(link_under(&parser, row, 0).is_some());
+
+        parser.screen_mut().set_scrollback(5);
+
+        assert_eq!(link_under(&parser, row, 0), None);
     }
 
     #[test]

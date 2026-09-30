@@ -664,6 +664,9 @@ pub struct App {
     last_config_reload_attempt: Instant,
     #[cfg(test)]
     pub notification_requests: Vec<NotificationRequest>,
+    /// Links a click asked to open, recorded instead of launching a browser or Explorer.
+    #[cfg(test)]
+    pub opened_links: Vec<crate::links::Target>,
     #[cfg(test)]
     pub update_install_requested_for: Option<String>,
     pub config: UserConfig,
@@ -820,6 +823,8 @@ impl App {
             last_config_reload_attempt: Instant::now() - Duration::from_secs(1),
             #[cfg(test)]
             notification_requests: Vec::new(),
+            #[cfg(test)]
+            opened_links: Vec::new(),
             #[cfg(test)]
             update_install_requested_for: None,
             config,
@@ -1529,6 +1534,26 @@ impl App {
                 self.github_reference_interval =
                     (self.github_reference_interval * 2).min(REFERENCE_SCAN_BACKOFF_LIMIT);
             }
+        }
+    }
+
+    /// Open a link a pane showed, within what a click is allowed to do.
+    ///
+    /// See [`crate::links`] for why a file is revealed rather than launched and why every
+    /// scheme but the web is refused.
+    pub fn open_link(&mut self, raw: &str) {
+        let Some(target) = crate::links::classify(raw) else {
+            self.status_message =
+                Some("Not opened: CST only follows web links and local files".to_string());
+            return;
+        };
+        #[cfg(test)]
+        {
+            self.opened_links.push(target);
+        }
+        #[cfg(not(test))]
+        if let Err(error) = crate::links::open(&target) {
+            self.status_message = Some(format!("Could not open link: {error}"));
         }
     }
 
