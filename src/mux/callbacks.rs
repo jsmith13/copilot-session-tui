@@ -52,6 +52,15 @@ struct OpenLink {
     target: String,
 }
 
+/// A link that is still on screen, for whoever needs to draw or reach it.
+pub struct LiveLink {
+    /// First cell, as (row, column).
+    pub start: (u16, u16),
+    /// One past the last cell, as (row, column).
+    pub end: (u16, u16),
+    pub target: String,
+}
+
 /// One hyperlink as drawn: where it sat, what it read, and where it pointed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LinkSpan {
@@ -94,21 +103,40 @@ impl PaneCallbacks {
     /// back, because links are recorded against the live screen and would line up with
     /// the wrong rows of history.
     pub fn link_at(&self, screen: &vt100::Screen, row: u16, column: u16) -> Option<String> {
-        if screen.scrollback() > 0 {
-            return None;
-        }
-        let alternate = screen.alternate_screen();
-        self.links
-            .iter()
-            .rev()
-            .find(|link| {
-                link.alternate == alternate
-                    && (row, column) >= link.start
-                    && (row, column) < link.end
-                    && screen.contents_between(link.start.0, link.start.1, link.end.0, link.end.1)
-                        == link.text
-            })
+        self.live_links(screen)
+            .find(|link| (row, column) >= link.start && (row, column) < link.end)
             .map(|link| link.target.clone())
+    }
+
+    /// Every link still showing on the live screen, as `(start, end, target)` cells.
+    ///
+    /// The same rule as [`Self::link_at`], so what gets drawn as a hyperlink and what a
+    /// click can reach never disagree.
+    pub fn links_on_screen(&self, screen: &vt100::Screen) -> Vec<LiveLink> {
+        self.live_links(screen)
+            .map(|link| LiveLink {
+                start: link.start,
+                end: link.end,
+                target: link.target.clone(),
+            })
+            .collect()
+    }
+
+    /// Links whose cells still read what they read when drawn, newest first.
+    ///
+    /// Nothing while scrolled back through history: links are recorded against the live
+    /// screen, and scrolled back the same cells show older rows.
+    fn live_links<'a>(
+        &'a self,
+        screen: &'a vt100::Screen,
+    ) -> impl Iterator<Item = &'a LinkSpan> + 'a {
+        let live = screen.scrollback() == 0;
+        let alternate = screen.alternate_screen();
+        self.links.iter().rev().filter(move |link| {
+            live && link.alternate == alternate
+                && screen.contents_between(link.start.0, link.start.1, link.end.0, link.end.1)
+                    == link.text
+        })
     }
 
     /// Follow an OSC 8 sequence: `8 ; params ; target` opens a link, an empty target

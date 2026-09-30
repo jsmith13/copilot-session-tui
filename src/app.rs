@@ -667,6 +667,12 @@ pub struct App {
     /// Links a click asked to open, recorded instead of launching a browser or Explorer.
     #[cfg(test)]
     pub opened_links: Vec<crate::links::Target>,
+
+    /// CST is running on a remote host the user reached over SSH.
+    ///
+    /// Anything CST launches then starts on that host, not on the machine the user is
+    /// looking at, so it must not try to open files on their behalf.
+    pub over_ssh: bool,
     #[cfg(test)]
     pub update_install_requested_for: Option<String>,
     pub config: UserConfig,
@@ -825,6 +831,7 @@ impl App {
             notification_requests: Vec::new(),
             #[cfg(test)]
             opened_links: Vec::new(),
+            over_ssh: crate::links::running_over_ssh(|name| std::env::var_os(name).is_some()),
             #[cfg(test)]
             update_install_requested_for: None,
             config,
@@ -1542,18 +1549,46 @@ impl App {
     /// See [`crate::links`] for why a file is revealed rather than launched and why every
     /// scheme but the web is refused.
     pub fn open_link(&mut self, raw: &str) {
-        let Some(target) = crate::links::classify(raw) else {
-            self.status_message =
-                Some("Not opened: CST only follows web links and local files".to_string());
-            return;
+        let target = match crate::links::classify(raw) {
+            None => {
+                self.status_message =
+                    Some("Not opened: CST only follows web links and local files".to_string());
+                return;
+            }
+            // Already open. Web links are drawn as real hyperlinks, so the terminal opened
+            // this one itself — on the machine the user is sitting at, which over SSH is
+            // the only right one. Windows Terminal also forwards the same click, so
+            // opening it here as well would give every such click two browser tabs.
+            Some(crate::links::Target::Web(_)) => return,
+            Some(crate::links::Target::File(path)) if self.over_ssh => {
+                self.status_message = Some(format!(
+                    "Not opened: {} is on the machine CST is running on, not this one",
+                    path.display()
+                ));
+                return;
+            }
+            Some(crate::links::Target::File(path)) => path,
         };
         #[cfg(test)]
         {
-            self.opened_links.push(target);
+            self.opened_links.push(crate::links::Target::File(target));
         }
         #[cfg(not(test))]
-        if let Err(error) = crate::links::open(&target) {
+        if let Err(error) = crate::links::reveal(&target) {
             self.status_message = Some(format!("Could not open link: {error}"));
+        }
+    }
+
+    /// Web links in whatever pane is showing, to be drawn as real hyperlinks.
+    pub fn visible_hyperlinks(&self) -> Vec<crate::ui::hyperlinks::HyperlinkRun> {
+        match self.view {
+            View::Attached(id) => self
+                .mux
+                .as_ref()
+                .and_then(|mux| mux.pane(id))
+                .map(crate::mux::Pane::web_hyperlinks)
+                .unwrap_or_default(),
+            _ => Vec::new(),
         }
     }
 

@@ -1,18 +1,25 @@
-//! Opening what a link in a pane points at.
+//! What a link in a pane may do when clicked.
 //!
 //! A link's target is written by the child — which for a Copilot pane means by an agent,
 //! from text it may have read anywhere, including a stranger's GitHub comment. So the
 //! question here is not only "how do I open this" but "what may a click do at all".
 //!
-//! Web links open in the browser. A file link never launches the file: it opens the folder
-//! with the file selected. That keeps a link to an `.exe` or a `.ps1` from running anything
-//! while leaving the user a double-click away from the `.html` they wanted. Every other
-//! scheme is refused outright — `ms-settings:`, `vscode:` and friends are handlers that act
-//! on a click, and nothing an agent printed should be able to reach them.
+//! Web links are not opened here. They are drawn as real hyperlinks (see
+//! [`crate::ui::hyperlinks`]) and the terminal opens them, on the machine the user is
+//! sitting at — the only way that works when CST runs on a remote host over SSH. CST must
+//! not open them as well: Windows Terminal opens a hyperlink *and* forwards the same click
+//! to the program underneath, so doing both gives every click two browser tabs.
 //!
-//! Nothing here goes through a shell. Targets are passed as program arguments, and the one
-//! place Windows forces a hand-built command line — Explorer's `/select,` — is guarded by
-//! refusing any path containing a quote.
+//! A file link is CST's to handle, and it never launches the file: it opens the folder with
+//! the file selected. That keeps a link to an `.exe` or a `.ps1` from running anything
+//! while leaving the user a double-click away from the `.html` they wanted. It is never
+//! handed to the terminal, which would open it with whatever the file type launches.
+//!
+//! Every other scheme is refused outright — `ms-settings:`, `vscode:` and friends are
+//! handlers that act on a click, and nothing an agent printed should be able to reach them.
+//!
+//! Nothing here goes through a shell. The one place Windows forces a hand-built command line
+//! — Explorer's `/select,` — is guarded by refusing any path containing a quote.
 
 // Under test nothing is launched — `App::open_link` records the target instead — so the
 // launching half of this module is unused there. Same arrangement as `notifications`.
@@ -25,7 +32,7 @@ use std::process::Command;
 /// What a link may be opened as.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
-    /// An `http` or `https` address, opened in the browser.
+    /// An `http` or `https` address, drawn as a hyperlink for the terminal to open.
     Web(String),
     /// A file or folder, revealed in the file manager and never launched.
     File(PathBuf),
@@ -102,35 +109,19 @@ fn percent_decode(text: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-/// Open a target: a web page in the browser, a file by showing it in its folder.
-pub fn open(target: &Target) -> Result<()> {
-    match target {
-        Target::Web(url) => open_web(url),
-        Target::File(path) => reveal(path),
-    }
+/// Whether this process was started inside an SSH session.
+///
+/// OpenSSH sets these for the remote shell on Linux and on Windows, and anything started
+/// from it — tmux included — inherits them. Takes a lookup rather than reading the
+/// environment itself so tests do not depend on how they were launched.
+pub fn running_over_ssh(is_set: impl Fn(&str) -> bool) -> bool {
+    ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"]
+        .into_iter()
+        .any(is_set)
 }
 
-fn open_web(url: &str) -> Result<()> {
-    let mut command = if cfg!(windows) {
-        // Hands the URL to the registered protocol handler without a shell in between,
-        // so an `&` in a query string stays part of the URL.
-        let mut command = Command::new("rundll32.exe");
-        command.args(["url.dll,FileProtocolHandler", url]);
-        command
-    } else if cfg!(target_os = "macos") {
-        let mut command = Command::new("open");
-        command.arg(url);
-        command
-    } else {
-        let mut command = Command::new("xdg-open");
-        command.arg(url);
-        command
-    };
-    command.spawn().context("Could not start the browser")?;
-    Ok(())
-}
-
-fn reveal(path: &Path) -> Result<()> {
+/// Show a file selected in its folder, without ever launching it.
+pub fn reveal(path: &Path) -> Result<()> {
     if !path.exists() {
         match path.parent().filter(|parent| parent.is_dir()) {
             // The file is gone but its folder is not: showing the folder is still the
@@ -285,36 +276,22 @@ mod tests {
         assert_eq!(classify("file://elsewhere/x.html"), None);
     }
 
-    /// Hands a real URL to the real browser.
-    ///
-    /// Everything else here runs with launching compiled out, so this is the only proof
-    /// the command line itself is right. Point it at a listener you control and check the
-    /// request arrives with its query string intact — an `&` is exactly what a shell in
-    /// between would have eaten.
-    #[test]
-    #[ignore = "opens the default browser; run with CST_LINKS_LIVE_URL=<url>"]
-    fn a_web_link_really_reaches_the_browser() {
-        let Ok(url) = std::env::var("CST_LINKS_LIVE_URL") else {
-            return;
-        };
-        let target = classify(&url).expect("a web link");
-        assert!(matches!(target, Target::Web(_)));
-        open(&target).expect("the browser should start");
-    }
-
     /// Hands a real file to the real file manager.
     ///
-    /// Aim it at a script that leaves a marker behind if it ever runs: the point of
-    /// revealing rather than opening is that the marker never appears.
+    /// Everything else here runs with launching compiled out, so this is the only proof the
+    /// command line itself is right — Explorer's `/select,` in particular, which has to be
+    /// built by hand. Aim it at a script that leaves a marker behind if it ever runs: the
+    /// point of revealing rather than opening is that the marker never appears.
     #[test]
     #[ignore = "opens a file manager window; run with CST_LINKS_LIVE_FILE=<path>"]
     fn a_file_link_really_reveals_the_file() {
         let Ok(path) = std::env::var("CST_LINKS_LIVE_FILE") else {
             return;
         };
-        let target = classify(&path).expect("a file link");
-        assert!(matches!(target, Target::File(_)));
-        open(&target).expect("the file manager should start");
+        let Some(Target::File(path)) = classify(&path) else {
+            panic!("{path} is not a file link");
+        };
+        reveal(&path).expect("the file manager should start");
     }
 
     #[test]
