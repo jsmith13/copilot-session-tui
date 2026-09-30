@@ -2,6 +2,7 @@ pub mod command_palette;
 pub mod diff;
 pub mod file_tree;
 pub mod github_inspector;
+pub mod hyperlinks;
 pub mod pane;
 pub mod popups;
 pub mod scratchpad;
@@ -82,6 +83,20 @@ pub struct AttachedLayout {
     pub scratchpad: Option<Rect>,
     pub terminal: Option<Rect>,
     pub status: Rect,
+}
+
+impl AttachedLayout {
+    /// Where the session pane's own cells go: inside the chat box's border.
+    ///
+    /// One definition, because two things must agree on it exactly — where panes are
+    /// sized to, and where anything that addresses a pane's cells from outside thinks they
+    /// are. A click, or a link drawn over the frame, lands a cell off otherwise.
+    pub fn chat_pane(&self) -> Rect {
+        self.chat.inner(ratatui::layout::Margin {
+            horizontal: 1,
+            vertical: 1,
+        })
+    }
 }
 
 /// Padding row, the labels, then the rule that underlines the focused tab.

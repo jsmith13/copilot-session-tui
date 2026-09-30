@@ -141,6 +141,21 @@ pub fn handle_attached_event(app: &mut App, event: Event) {
     }
 
     if let Event::Mouse(mouse) = &event {
+        // Ctrl+click, as in any terminal. A plain click still belongs to the child, which
+        // uses it for its own interface.
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && mouse.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            let link = app
+                .mux
+                .as_ref()
+                .and_then(|mux| mux.focused_pane())
+                .and_then(|pane| pane.link_at(mouse.column, mouse.row));
+            if let Some(link) = link {
+                app.open_link(&link);
+                return;
+            }
+        }
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             let reference = app
                 .mux
@@ -2933,6 +2948,243 @@ mod tests {
             turns >= 3,
             "three notices cannot be delivered in fewer than three turns"
         );
+    }
+
+    /// Put a named link on an attached pane's screen, with the pane where the event loop
+    /// would put it in a 100×30 terminal.
+    ///
+    /// Positioned by the production layout rather than by hand. A hand-picked origin is
+    /// how this test first went wrong: the pane was sized to one place and drawn in
+    /// another, and only the frame test noticed. Returns the pane's origin in outer
+    /// coordinates, which is never (0, 0) — the chat box's border sits there — so every
+    /// click below also proves the outer-to-pane translation.
+    fn app_showing_a_link(session: &str, target: &str) -> (App, u16, u16) {
+        let mut app = attached_mux_app(session);
+        // Read from the environment in real use; pinned so these tests mean the same thing
+        // however they are run, including from an SSH session.
+        app.over_ssh = false;
+        let pane_area = crate::ui::attached_layout(
+            ratatui::layout::Rect::new(0, 0, 100, 30),
+            app.attached_scratchpad_visible(),
+            app.attached_terminal_visible(),
+            app.tab_bar_visible(),
+        )
+        .chat_pane();
+        app.mux.as_mut().unwrap().resize_all_at(
+            pane_area.x,
+            pane_area.y,
+            pane_area.height,
+            pane_area.width,
+        );
+        // The child is a real process, and ConPTY clears the screen as it starts and as it
+        // is resized. Let that land first, or it can wipe the link before it is used.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        app.mux
+            .as_mut()
+            .unwrap()
+            .pane_mut(1)
+            .unwrap()
+            .feed_synthetic(
+                format!("\x1b[1;1Hsee \x1b]8;;{target}\x1b\\Open the local gallery\x1b]8;;\x1b\\.")
+                    .as_bytes(),
+            );
+        (app, pane_area.x, pane_area.y)
+    }
+
+    fn mouse_down(column: u16, row: u16, modifiers: KeyModifiers) -> Event {
+        Event::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers,
+        })
+    }
+
+    /// The report, through the real input path.
+    ///
+    /// A coworker clicked "Open the local gallery" and nothing happened. The link's target
+    /// lived only in the escape sequence, which CST used to drop, so no click could ever
+    /// have reached it.
+    #[test]
+    fn ctrl_clicking_a_named_link_opens_where_it_points() {
+        let (mut app, x, y) = app_showing_a_link("links", "file:///D:/gallery/index.html");
+        // The link's text runs from pane column 4 to 25; this is a letter in the middle.
+        let on_link = x + 10;
+
+        handle_attached_event(&mut app, mouse_down(on_link, y, KeyModifiers::NONE));
+        assert!(
+            app.opened_links.is_empty(),
+            "a plain click still belongs to Copilot, which uses it for its own interface"
+        );
+
+        handle_attached_event(&mut app, mouse_down(on_link, y, KeyModifiers::CONTROL));
+        assert_eq!(app.opened_links.len(), 1, "got: {:?}", app.status_message);
+        assert!(matches!(
+            &app.opened_links[0],
+            crate::links::Target::File(_)
+        ));
+
+        handle_attached_event(&mut app, mouse_down(x + 26, y, KeyModifiers::CONTROL));
+        assert_eq!(
+            app.opened_links.len(),
+            1,
+            "the full stop after the link is not part of it"
+        );
+        let _ = app.mux.as_mut().unwrap().shutdown();
+    }
+
+    /// Draw one real frame of `app` through the production path, returning the bytes a
+    /// terminal would receive. `links` false leaves hyperlinks out, for comparison.
+    fn frame_bytes(app: &mut App, links: bool) -> Vec<u8> {
+        #[derive(Clone, Default)]
+        struct Recorder(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Recorder {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let recorder = Recorder::default();
+        let mut terminal = ratatui::Terminal::with_options(
+            ratatui::backend::CrosstermBackend::new(recorder.clone()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 100, 30)),
+            },
+        )
+        .unwrap();
+        crate::synchronized_frame(&mut terminal, |frame| {
+            crate::ui::draw(frame, app);
+            if links {
+                app.visible_hyperlinks()
+            } else {
+                Vec::new()
+            }
+        })
+        .unwrap();
+        let bytes = recorder.0.lock().unwrap().clone();
+        bytes
+    }
+
+    fn screen_after(bytes: &[u8]) -> (String, Vec<String>) {
+        let mut parser = vt100::Parser::new(30, 100, 0);
+        parser.process(bytes);
+        let screen = parser.screen();
+        let styles = (0..30u16)
+            .flat_map(|row| (0..100u16).map(move |col| (row, col)))
+            .filter_map(|(row, col)| screen.cell(row, col))
+            .map(|cell| {
+                format!(
+                    "{:?}{:?}{}",
+                    cell.fgcolor(),
+                    cell.bgcolor(),
+                    cell.underline()
+                )
+            })
+            .collect();
+        (screen.contents(), styles)
+    }
+
+    /// The SSH requirement, end to end through a real frame.
+    ///
+    /// Over SSH, CST runs on the remote host and cannot reach the local browser — except
+    /// through what it writes. So the link has to leave CST as a real hyperlink, and the
+    /// terminal on the user's machine opens it. This draws a frame the way the event loop
+    /// does and checks both halves: the hyperlink is there around the right text, and
+    /// adding it changed nothing a person could see.
+    #[test]
+    fn a_web_link_leaves_cst_as_a_real_hyperlink_without_changing_the_picture() {
+        let url = "https://example.com/gallery?a=1&b=2";
+        let (mut app, _, _) = app_showing_a_link("hyperlink-frame", url);
+
+        let with = frame_bytes(&mut app, true);
+        let text = String::from_utf8_lossy(&with);
+        let open = text
+            .find(&format!("\x1b]8;;{url}\x1b\\"))
+            .unwrap_or_else(|| panic!("no hyperlink in the frame: {text:?}"));
+        let close = open + text[open..].find("\x1b]8;;\x1b\\").expect("closed");
+        assert!(
+            text[open..close].contains("Open"),
+            "the hyperlink wraps the link's own text, got {:?}",
+            &text[open..close]
+        );
+
+        let without = frame_bytes(&mut app, false);
+        assert_eq!(
+            screen_after(&with),
+            screen_after(&without),
+            "reprinting the link must land exactly on itself — text and colours both"
+        );
+        let _ = app.mux.as_mut().unwrap().shutdown();
+    }
+
+    #[test]
+    fn a_file_link_is_never_handed_to_the_terminal() {
+        // A terminal opens a file link with whatever the file type launches, which for an
+        // .exe means running it. CST keeps those to itself.
+        let (mut app, _, _) =
+            app_showing_a_link("file-frame", "file:///C:/Windows/System32/calc.exe");
+        let text = String::from_utf8_lossy(&frame_bytes(&mut app, true)).into_owned();
+        assert!(!text.contains("\x1b]8;"), "got {text:?}");
+        let _ = app.mux.as_mut().unwrap().shutdown();
+    }
+
+    /// The terminal already opened a web link, so CST must not open it too.
+    ///
+    /// Windows Terminal opens the hyperlink *and* forwards the same Ctrl+click to the
+    /// program underneath. Opening it here as well is how other tools ended up giving
+    /// every click two browser tabs.
+    #[test]
+    fn ctrl_clicking_a_web_link_leaves_the_opening_to_the_terminal() {
+        let (mut app, x, y) = app_showing_a_link("web-click", "https://example.com/report");
+
+        handle_attached_event(&mut app, mouse_down(x + 10, y, KeyModifiers::CONTROL));
+
+        assert!(
+            app.opened_links.is_empty(),
+            "the terminal opened it already"
+        );
+        assert_eq!(app.status_message, None, "and there is nothing to report");
+        let _ = app.mux.as_mut().unwrap().shutdown();
+    }
+
+    #[test]
+    fn over_ssh_a_file_link_says_where_the_file_is_instead_of_opening_it() {
+        // Opened here it would appear on the remote host's desktop, where nobody is looking.
+        let (mut app, x, y) = app_showing_a_link("ssh-file", "file:///D:/gallery/index.html");
+        app.over_ssh = true;
+
+        handle_attached_event(&mut app, mouse_down(x + 10, y, KeyModifiers::CONTROL));
+
+        assert!(app.opened_links.is_empty());
+        assert!(
+            app.status_message
+                .as_deref()
+                .is_some_and(|message| message.contains("machine CST is running on")),
+            "got {:?}",
+            app.status_message
+        );
+        let _ = app.mux.as_mut().unwrap().shutdown();
+    }
+
+    /// A link to a handler that acts on a click is shown, and refused when clicked.
+    #[test]
+    fn a_link_to_anything_but_the_web_or_a_file_is_refused() {
+        let (mut app, x, y) = app_showing_a_link("refused", "ms-settings:privacy");
+
+        handle_attached_event(&mut app, mouse_down(x + 10, y, KeyModifiers::CONTROL));
+
+        assert!(app.opened_links.is_empty());
+        assert!(
+            app.status_message
+                .as_deref()
+                .is_some_and(|message| message.starts_with("Not opened")),
+            "the user is told why nothing happened, got: {:?}",
+            app.status_message
+        );
+        let _ = app.mux.as_mut().unwrap().shutdown();
     }
 
     fn send_prefix_command(app: &mut App, command: char) {

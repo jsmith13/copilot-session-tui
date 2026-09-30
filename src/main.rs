@@ -11,6 +11,7 @@ mod github;
 mod hook_plugin;
 mod host_terminal;
 mod input;
+mod links;
 mod mux;
 mod mux_input;
 mod notifications;
@@ -1131,10 +1132,7 @@ fn run_app(
                 }
             }
 
-            let chat = layout.chat.inner(ratatui::layout::Margin {
-                horizontal: 1,
-                vertical: 1,
-            });
+            let chat = layout.chat_pane();
             let rows = chat.height.max(1);
             let cols = chat.width.max(1);
             if app.pane_size != (rows, cols) || app.pane_origin != (chat.x, chat.y) {
@@ -1414,15 +1412,33 @@ fn pump_mux(app: &mut App) -> Result<bool> {
 /// No view asks for the terminal's real cursor — panes paint their own — so ratatui
 /// leaves it hidden for the whole session and nothing drags it across the screen.
 fn draw_frame(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
-    synchronized_frame(terminal, |frame| ui::draw(frame, app))
+    synchronized_frame(terminal, |frame| {
+        ui::draw(frame, app);
+        // Read after drawing, so the pane's position is the one this frame used.
+        app.visible_hyperlinks()
+    })
 }
 
+/// Draw a frame, then turn the links on it into real hyperlinks — one terminal update.
+///
+/// The links go in the same update as the frame, so the terminal never shows a moment
+/// where the text is there and the link behind it is not.
 fn synchronized_frame<W: io::Write>(
     terminal: &mut Terminal<CrosstermBackend<W>>,
-    render: impl FnOnce(&mut ratatui::Frame),
+    render: impl FnOnce(&mut ratatui::Frame) -> Vec<ui::hyperlinks::HyperlinkRun>,
 ) -> Result<()> {
     execute!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
-    let drawn = terminal.draw(render).map(|_| ());
+    let mut links = Vec::new();
+    let drawn = terminal
+        .draw(|frame| links = render(frame))
+        .map(|frame| ui::hyperlinks::overlay(&links, frame.buffer))
+        .and_then(|bytes| {
+            if !bytes.is_empty() {
+                terminal.backend_mut().write_all(&bytes)?;
+                terminal.backend_mut().flush()?;
+            }
+            Ok(())
+        });
     // Closing the update matters even when the draw failed: leaving it open would freeze
     // the terminal on a half-written frame.
     execute!(terminal.backend_mut(), EndSynchronizedUpdate)?;
@@ -1661,6 +1677,7 @@ mod tests {
 
         synchronized_frame(&mut terminal, |frame| {
             frame.render_widget(ratatui::widgets::Paragraph::new("hello"), frame.area());
+            Vec::new()
         })
         .expect("recording writer cannot fail");
 

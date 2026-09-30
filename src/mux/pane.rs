@@ -537,6 +537,58 @@ impl Pane {
             .flatten()
     }
 
+    /// Where the hyperlink under an outer-terminal coordinate points, if there is one.
+    pub fn link_at(&self, column: u16, row: u16) -> Option<String> {
+        let (row, column) = self.viewport.cell_coordinates(column, row)?;
+        let parser = self.parser.lock().ok()?;
+        parser.callbacks().link_at(parser.screen(), row, column)
+    }
+
+    /// The web links on screen, in outer-terminal coordinates, ready to be drawn as real
+    /// hyperlinks.
+    ///
+    /// Web links only. A file link handed to a terminal is opened with whatever the file's
+    /// type launches, so those stay with CST, which reveals rather than runs them.
+    pub fn web_hyperlinks(&self) -> Vec<crate::ui::hyperlinks::HyperlinkRun> {
+        let Ok(parser) = self.parser.lock() else {
+            return Vec::new();
+        };
+        let screen = parser.screen();
+        let (_, width) = screen.size();
+        parser
+            .callbacks()
+            .links_on_screen(screen)
+            .into_iter()
+            .filter_map(|crate::mux::callbacks::LiveLink { start, end, target }| {
+                let Some(crate::links::Target::Web(url)) = crate::links::classify(&target) else {
+                    return None;
+                };
+                let mut cells = Vec::new();
+                let (mut row, mut column) = start;
+                while (row, column) < end {
+                    let cell = screen.cell(row, column)?;
+                    // The right half of a wide character is drawn by its left half.
+                    if !cell.is_wide_continuation()
+                        && row < self.viewport.rows
+                        && column < self.viewport.cols
+                    {
+                        cells.push((
+                            self.viewport.x + column,
+                            self.viewport.y + row,
+                            cell.contents().to_string(),
+                        ));
+                    }
+                    column += 1;
+                    if column >= width {
+                        column = 0;
+                        row += 1;
+                    }
+                }
+                Some(crate::ui::hyperlinks::HyperlinkRun { target: url, cells })
+            })
+            .collect()
+    }
+
     /// Every `#1234` currently on the pane's screen.
     ///
     /// Used to look up what those numbers point at, so they can be decorated.
