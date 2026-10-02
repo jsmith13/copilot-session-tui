@@ -119,6 +119,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         if app.confirm_update_restart {
             popups::draw_update_restart_confirm(f, app);
         }
+        if app.confirm_end_tmux.is_some() {
+            popups::draw_end_tmux_confirm(f, app);
+        }
         if app.confirm_quit {
             popups::draw_quit_confirm(f, app);
         }
@@ -135,6 +138,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         whats_new::draw(f, app);
         if app.confirm_update_restart {
             popups::draw_update_restart_confirm(f, app);
+        }
+        if app.confirm_end_tmux.is_some() {
+            popups::draw_end_tmux_confirm(f, app);
         }
         if app.confirm_quit {
             popups::draw_quit_confirm(f, app);
@@ -196,6 +202,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         whats_new::draw(f, app);
         if app.confirm_update_restart {
             popups::draw_update_restart_confirm(f, app);
+        }
+        if app.confirm_end_tmux.is_some() {
+            popups::draw_end_tmux_confirm(f, app);
         }
         if app.confirm_quit {
             popups::draw_quit_confirm(f, app);
@@ -296,6 +305,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     whats_new::draw(f, app);
     if app.confirm_update_restart {
         popups::draw_update_restart_confirm(f, app);
+    }
+    if app.confirm_end_tmux.is_some() {
+        popups::draw_end_tmux_confirm(f, app);
     }
     if app.confirm_quit {
         popups::draw_quit_confirm(f, app);

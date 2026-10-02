@@ -168,6 +168,29 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         status,
     ]));
 
+    if let Some(reference) = app.tmux_session_for(&session.id) {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "  Host: ",
+                Style::default()
+                    .fg(super::semantic_foreground_on(
+                        theme,
+                        theme.warning,
+                        theme.background,
+                    ))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("tmux · {} · persistent", reference.tmux_session),
+                Style::default().fg(super::semantic_foreground_on(
+                    theme,
+                    theme.accent_alt,
+                    theme.background,
+                )),
+            ),
+        ]));
+    }
+
     lines.push(Line::from(""));
 
     // Session stats
@@ -312,6 +335,7 @@ fn textwrap(text: &str, max_width: usize) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::config::UserConfig;
+    use crate::session::Session;
     use crate::theme::ThemeName;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -339,5 +363,45 @@ mod tests {
             .all(|cell| cell.bg == theme.background));
         assert_eq!(buffer[(3, 1)].symbol(), "S");
         assert_eq!(buffer[(3, 1)].fg, theme.text);
+    }
+
+    #[test]
+    fn tmux_host_and_session_name_are_visible_in_details() {
+        let session = Session {
+            id: "persistent-session".to_string(),
+            cwd: "/tmp/project".to_string(),
+            project_root: "/tmp/project".to_string(),
+            summary: Some("Persistent".to_string()),
+            created_at: None,
+            updated_at: None,
+            is_active: true,
+            dir_path: std::path::PathBuf::from("/tmp/session"),
+            edited_files: Vec::new(),
+            last_user_message: None,
+            turn_count: 0,
+            tool_call_count: 0,
+            details_parsed_len: 0,
+        };
+        let mut app = App::new(vec![session], UserConfig::default());
+        app.replace_tmux_session(crate::session::tmux::TmuxSessionRef {
+            session_id: "persistent-session".to_string(),
+            tmux_session: "cst-persistent-12345678".to_string(),
+            cwd: std::path::PathBuf::from("/tmp/project"),
+            server_socket: None,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+
+        terminal
+            .draw(|frame| draw(frame, &app, frame.area()))
+            .unwrap();
+
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("tmux · cst-persistent-12345678 · persistent"));
     }
 }

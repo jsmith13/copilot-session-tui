@@ -206,12 +206,16 @@ This creates a `cst` function. Use `cst` instead of `copilot-session-tui` and yo
 | `↑/k` `↓/j` | Navigate sessions |
 | `Home` / `End` | Jump to first/last |
 | `Enter` | Resume selected session |
+| `t` | Resume selected session persistently via tmux |
 | `Space` | Toggle selected session favorite |
 | `g` | Grab the selected favorite, then `↑`/`↓` to move it |
 | `T` | Open inactive favorites as panes or Windows Terminal tabs |
 | `e` | Open selected session scratchpad |
 | `n` | New session in the filtered project (or the current directory's project) |
+| `m` | New persistent tmux-backed session in the current project |
 | `N` | New isolated worktree session with an editable branch name |
+| `M` | New persistent tmux-backed session in an isolated worktree |
+| `X` | End the selected persistent tmux session |
 | `r` | Rename session |
 | `d` | Delete session (with confirmation) |
 | `/` | Fuzzy search |
@@ -350,8 +354,9 @@ While attached to a session, every keystroke goes to Copilot except the prefix k
 | `prefix` `n` / `p` | Next / previous session |
 | `prefix` `m` | Move this tab: `←`/`→` slide it, `Esc` when done |
 | `prefix` `1`–`9` | Jump to a session by number |
-| `prefix` `x` | End the focused session for good |
-| `prefix` `q` | End the focused session and quit CST together |
+| `prefix` `x` | End a CST-owned session or detach a tmux-backed tab |
+| `prefix` `X` | End the persistent tmux session and stop Copilot |
+| `prefix` `q` | Quit CST; direct sessions end and tmux-backed sessions detach |
 | `prefix` `prefix` | Search every CST command |
 
 ### Reordering tabs
@@ -596,7 +601,8 @@ autosave retain 100–250 ms polling.
 
 The prefix also works from the session list, so detaching never strands a running pane:
 `prefix` `w` opens the switcher, `prefix` `n`/`p` and `prefix` `1`–`9` re-attach directly,
-and `prefix` `x` ends the focused one. The footer shows how many panes are running.
+and `prefix` `x` closes the focused tab (ending a direct session or detaching a
+tmux-backed one). The footer shows how many panes are running.
 
 Pressing the prefix opens a Doom Emacs-style grouped command overlay instead of squeezing
 every shortcut into the status line. The groups separate workspace, session, tool, and
@@ -852,6 +858,63 @@ silently changes the number; press it again to go back to inheriting.
 A relative global root is resolved from the global config directory. A relative
 project root override is resolved from the repository root. Invalid project JSON is
 reported and is never silently overwritten.
+
+### Persistent tmux-backed sessions
+
+Press `t` to resume the selected conversation with tmux owning its Copilot process.
+Press `m` to start a new Copilot conversation for the current project with tmux owning
+the Copilot process. Press `M` to create the same managed Git worktree as `N` and start
+its conversation the same way.
+
+With CST's multiplexer enabled, the tmux client opens inside an ordinary CST tab. The
+outer CST TUI remains active, closing the tab only detaches that client, and the Copilot
+process survives CST exiting or an SSH disconnection. Selecting the session again
+reattaches its existing tmux session instead of offering to take over the active Copilot
+process.
+
+The session list uses `◇` for a detached persistent session and `◆` when its tmux client
+is open as a CST pane. The detail view shows the owning tmux session name. Use `X` from
+the list or `prefix X` from a pane to explicitly stop Copilot and end the tmux session;
+ordinary `x` only closes or detaches the CST tab. End a persistent session before
+deleting its history or managed worktree.
+
+Without CST's multiplexer, CST restores the terminal and attaches tmux in the foreground,
+following the same launcher lifecycle as ordinary `n` and `N` sessions.
+
+tmux-backed sessions require a Unix-like platform with `tmux` on `PATH`. CST checks
+availability before leaving the TUI, removes stale registry entries, and treats a tmux
+session that exits during startup as a launch failure so a newly-created managed worktree
+can be rolled back.
+
+CST-owned sessions run on a dedicated tmux server socket. CST enables tmux clipboard
+forwarding on that server, allowing Copilot's OSC 52 copy actions to reach the outer
+terminal without changing the clipboard policy of unrelated tmux sessions. Copilot is
+launched with `TMUX` removed from its environment so its Copy action uses the same OSC 52
+path as a direct CST pane; tmux still owns the process and provides persistence.
+Persistent sessions created by an older CST build retain their original server and
+environment; end and resume one with `t` to move it onto the dedicated server and gain
+clipboard forwarding.
+
+The four tmux action keys are configurable in `config.json`. Resume, new-session, and
+new-worktree keys are used from the session list; persistent-session termination is also
+available after the multiplexer prefix:
+
+```json
+{
+  "tmux_keys": {
+    "resume_session": "t",
+    "new_session": "m",
+    "new_worktree": "M",
+    "end_session": "X"
+  }
+}
+```
+
+Each value must be one distinct printable ASCII character.
+
+While a Copilot pane is attached, plain `m` and `M` remain ordinary chat input and
+`prefix m` opens upstream's tab-move mode. Use Command Search (`prefix prefix`) to start
+a persistent session without returning to the session list.
 
 ### `.worktreeinclude`
 

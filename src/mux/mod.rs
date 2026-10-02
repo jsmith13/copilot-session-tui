@@ -177,6 +177,7 @@ pub enum PrefixCommand {
     NextPane,
     PreviousPane,
     KillPane,
+    EndPersistentSession,
     PaneList,
     Chat,
     Scratchpad,
@@ -185,7 +186,7 @@ pub enum PrefixCommand {
     Update,
     Help,
     Github,
-    /// `prefix q` — end the focused session and CST together.
+    /// `prefix q` — quit CST and close its pane clients.
     Quit,
     /// `prefix m` — enter the sticky mode that slides the focused tab.
     MoveTab,
@@ -195,9 +196,21 @@ pub enum PrefixCommand {
     Cancel,
 }
 
+#[cfg(test)]
 pub fn resolve_prefix_command(key: &KeyEvent, prefix: &KeyChord) -> Option<PrefixCommand> {
+    resolve_prefix_command_with_tmux_keys(key, prefix, &crate::config::TmuxKeyConfig::default())
+}
+
+pub fn resolve_prefix_command_with_tmux_keys(
+    key: &KeyEvent,
+    prefix: &KeyChord,
+    tmux_keys: &crate::config::TmuxKeyConfig,
+) -> Option<PrefixCommand> {
     if prefix.matches(key) {
         return Some(PrefixCommand::CommandPalette);
+    }
+    if tmux_keys.matches_end_session(key.code) {
+        return Some(PrefixCommand::EndPersistentSession);
     }
     match key.code {
         KeyCode::Char('d') => Some(PrefixCommand::Detach),
@@ -625,6 +638,14 @@ mod tests {
             Some(PrefixCommand::Snippets)
         );
         assert_eq!(
+            resolve_prefix_command(&key(KeyCode::Char('m'), none), &chord),
+            Some(PrefixCommand::MoveTab)
+        );
+        assert_eq!(
+            resolve_prefix_command(&key(KeyCode::Char('M'), KeyModifiers::SHIFT), &chord),
+            None
+        );
+        assert_eq!(
             resolve_prefix_command(&key(KeyCode::Char('u'), none), &chord),
             Some(PrefixCommand::Update)
         );
@@ -659,6 +680,50 @@ mod tests {
         assert_eq!(
             resolve_prefix_command(&key(KeyCode::Char('z'), none), &chord),
             None
+        );
+    }
+
+    #[test]
+    fn persistent_end_prefix_follows_configured_key_without_shadowing_move_mode() {
+        let chord = KeyChord::parse("C-b").unwrap();
+        let keys = crate::config::TmuxKeyConfig {
+            resume_session: "t".to_string(),
+            new_session: "v".to_string(),
+            new_worktree: "V".to_string(),
+            end_session: "!".to_string(),
+        };
+
+        assert_eq!(
+            resolve_prefix_command_with_tmux_keys(
+                &key(KeyCode::Char('v'), KeyModifiers::NONE),
+                &chord,
+                &keys,
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_prefix_command_with_tmux_keys(
+                &key(KeyCode::Char('V'), KeyModifiers::SHIFT),
+                &chord,
+                &keys,
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_prefix_command_with_tmux_keys(
+                &key(KeyCode::Char('!'), KeyModifiers::SHIFT),
+                &chord,
+                &keys,
+            ),
+            Some(PrefixCommand::EndPersistentSession)
+        );
+        assert_eq!(
+            resolve_prefix_command_with_tmux_keys(
+                &key(KeyCode::Char('m'), KeyModifiers::NONE),
+                &chord,
+                &keys,
+            ),
+            Some(PrefixCommand::MoveTab)
         );
     }
 

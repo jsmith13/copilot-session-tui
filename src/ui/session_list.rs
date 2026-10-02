@@ -61,16 +61,26 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             let is_selected = display_idx == app.selected;
             let is_favorite = app.is_favorite(&session.id);
             let is_grabbed = app.grabbed_favorite.as_deref() == Some(session.id.as_str());
+            let tmux_backed = app.session_is_tmux_backed(&session.id);
 
             // Panes we own read differently from a foreign `inuse` lock: ours can be
             // re-attached, theirs cannot.
             let active_indicator = if app.has_running_pane_for(&session.id) {
                 Span::styled(
-                    "▶ ",
+                    if tmux_backed { "◆ " } else { "▶ " },
                     Style::default().fg(if is_selected {
                         selection_fg
                     } else {
                         super::semantic_foreground_on(theme, theme.accent, theme.background)
+                    }),
+                )
+            } else if tmux_backed {
+                Span::styled(
+                    "◇ ",
+                    Style::default().fg(if is_selected {
+                        selection_fg
+                    } else {
+                        super::semantic_foreground_on(theme, theme.accent_alt, theme.background)
                     }),
                 )
             } else if session.is_active {
@@ -319,6 +329,34 @@ pub mod tests {
         let name = "Publishing to f-droid 🚀 and elsewhere too, at length";
         let text = render_with(name, 40);
         assert!(text.contains("Publishing"), "got:\n{text}");
+    }
+
+    #[test]
+    fn tmux_owned_sessions_have_a_persistent_marker() {
+        let mut app = App::new(
+            vec![session_named("Persistent session")],
+            UserConfig::default(),
+        );
+        app.replace_tmux_session(crate::session::tmux::TmuxSessionRef {
+            session_id: "abcdef123456".to_string(),
+            tmux_session: "cst-persistent-abcdef12".to_string(),
+            cwd: PathBuf::from("C:/Workspace/zazen"),
+            server_socket: None,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains('◇'), "got:\n{text}");
     }
 
     /// Rows as grids of cell symbols, so positions can be compared in terminal columns

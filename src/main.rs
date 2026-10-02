@@ -55,6 +55,7 @@ use std::sync::Arc;
 use app::{App, NewSessionRequest};
 use session::loader;
 use session::manager;
+use session::tmux;
 
 #[derive(Parser)]
 #[command(name = "copilot-session-tui")]
@@ -451,12 +452,20 @@ fn main() -> Result<()> {
         if let Some(notice) = hook_refresh_notice.as_deref() {
             eprintln!("{notice}");
         }
-        eprintln!(
-            "Resuming session {} in {}...",
-            short_session_id(&session.id),
-            session.cwd
-        );
-        manager::resume_session(&session.id, &session.cwd, &user_config)?;
+        if let Some(reference) = tmux::find_live(&session.id)? {
+            eprintln!(
+                "Attaching persistent tmux session '{}'...",
+                reference.tmux_session
+            );
+            manager::attach_tmux_session(&reference)?;
+        } else {
+            eprintln!(
+                "Resuming session {} in {}...",
+                short_session_id(&session.id),
+                session.cwd
+            );
+            manager::resume_session(&session.id, &session.cwd, &user_config)?;
+        }
         if let Some(path) = &cli.last_dir_file {
             let _ = std::fs::write(path, &session.cwd);
         }
@@ -572,6 +581,11 @@ fn main() -> Result<()> {
     // Track the directory to write to --last-dir-file
     let mut last_dir: Option<String> = None;
 
+    if let Some(reference) = app.should_attach_tmux.take() {
+        last_dir = Some(reference.cwd.to_string_lossy().to_string());
+        manager::attach_tmux_session(&reference)?;
+    }
+
     // Resume session if requested
     if let Some((session_id, cwd)) = app.should_resume {
         eprintln!(
@@ -591,6 +605,30 @@ fn main() -> Result<()> {
                 last_dir = Some(cwd.clone());
                 manager::start_new_session(&cwd, &app.config)?;
             }
+            NewSessionRequest::Tmux { cwd, title } => {
+                eprintln!("Starting persistent tmux session in {}...", cwd);
+                let reference = manager::start_tmux_session(Path::new(&cwd), &title, &app.config)?;
+                last_dir = Some(cwd);
+                manager::attach_tmux_session(&reference)?;
+            }
+            NewSessionRequest::TmuxResume {
+                session_id,
+                cwd,
+                title,
+            } => {
+                eprintln!(
+                    "Resuming session {} in persistent tmux...",
+                    short_session_id(&session_id)
+                );
+                let reference = manager::resume_tmux_session(
+                    &session_id,
+                    Path::new(&cwd),
+                    &title,
+                    &app.config,
+                )?;
+                last_dir = Some(cwd);
+                manager::attach_tmux_session(&reference)?;
+            }
             NewSessionRequest::Worktree {
                 source_project,
                 branch,
@@ -603,6 +641,20 @@ fn main() -> Result<()> {
                     &app.config,
                 )?;
                 last_dir = Some(worktree.to_string_lossy().to_string());
+            }
+            NewSessionRequest::TmuxWorktree {
+                source_project,
+                branch,
+                config,
+            } => {
+                let reference = manager::start_worktree_tmux_session(
+                    &source_project,
+                    &branch,
+                    &config,
+                    &app.config,
+                )?;
+                last_dir = Some(reference.cwd.to_string_lossy().to_string());
+                manager::attach_tmux_session(&reference)?;
             }
         }
     }
@@ -1158,6 +1210,8 @@ fn run_app(
 
         input::maybe_load_details(app);
         app.poll_session_load();
+        app.poll_external_sessions();
+        repaint |= app.refresh_tmux_sessions();
         app.poll_update();
         app.poll_notifications();
         app.poll_github();
@@ -1304,7 +1358,10 @@ fn run_app(
             break;
         }
 
-        if app.should_resume.is_some() || app.should_new_session.is_some() {
+        if app.should_resume.is_some()
+            || app.should_attach_tmux.is_some()
+            || app.should_new_session.is_some()
+        {
             break;
         }
     }
@@ -1487,8 +1544,10 @@ fn mux_paint_due(app: &App, repaint: bool, last_paint: std::time::Instant) -> bo
 /// Ordinary chat input changes the child, not CST's current frame. Waiting for the
 /// child's output avoids rendering the stale pre-echo screen while holding its parser.
 fn prioritize_explicit_exit(app: &mut App) -> bool {
-    let requested =
-        app.should_quit || app.should_resume.is_some() || app.should_new_session.is_some();
+    let requested = app.should_quit
+        || app.should_resume.is_some()
+        || app.should_attach_tmux.is_some()
+        || app.should_new_session.is_some();
     if requested && app.update_restart_ready() {
         app.cancel_update_restart_for_user_action();
     }
@@ -1565,7 +1624,10 @@ fn desired_terminal_title(app: &App) -> String {
 
 fn exit_waits_for_update(app: &App) -> bool {
     app.update_installing()
-        && (app.should_quit || app.should_resume.is_some() || app.should_new_session.is_some())
+        && (app.should_quit
+            || app.should_resume.is_some()
+            || app.should_attach_tmux.is_some()
+            || app.should_new_session.is_some())
 }
 
 fn apply_terminal_event(app: &mut App, event: crossterm::event::Event) -> Result<()> {

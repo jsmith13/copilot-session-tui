@@ -1,9 +1,12 @@
 use crate::app::{App, GithubScrollbar, Mode, View, WorkspaceFocus, WorkspaceHelp};
 use crate::command_palette::CommandId;
-use crate::input::{handle_quit_confirm, handle_update_restart_confirm, request_quit};
+use crate::input::{
+    handle_end_tmux_confirm, handle_quit_confirm, handle_update_restart_confirm,
+    request_end_tmux_session, request_quit,
+};
 use crate::mux::pane::PaneNotification;
 use crate::mux::{
-    resolve_github_command, resolve_help_command, resolve_prefix_command,
+    resolve_github_command, resolve_help_command, resolve_prefix_command_with_tmux_keys,
     resolve_transient_command, GithubCommand, HelpCommand, MuxEvent, PrefixCommand, PrefixState,
     TransientCommand, TransientMode,
 };
@@ -21,6 +24,15 @@ const HOOK_READY_GRACE: std::time::Duration = std::time::Duration::from_millis(7
 /// Everything except the prefix key is forwarded to the child, because Copilot wants
 /// nearly every keystroke for itself.
 pub fn handle_attached_event(app: &mut App, event: Event) {
+    if app.confirm_end_tmux.is_some() {
+        if let Event::Key(key) = &event {
+            if key.kind == KeyEventKind::Press {
+                handle_end_tmux_confirm(app, key.code);
+            }
+        }
+        return;
+    }
+
     if app.confirm_update_restart {
         if let Event::Key(key) = &event {
             if key.kind == KeyEventKind::Press {
@@ -760,8 +772,16 @@ fn execute_palette_command(app: &mut App, command: CommandId) {
             close_context_overlays(app);
             kill_focused(app);
         }
+        EndPersistentSession => {
+            close_context_overlays(app);
+            end_focused_tmux(app);
+        }
         Quit => request_quit(app),
-        NewSession | NewWorktreeSession => {
+        NewSession
+        | NewTmuxSession
+        | NewWorktreeSession
+        | NewTmuxWorktreeSession
+        | ResumeSelectedInTmux => {
             close_context_overlays(app);
             crate::input::execute_palette_list_command(app, command);
         }
@@ -834,7 +854,7 @@ fn handle_attached_key(app: &mut App, key: KeyEvent) {
     }
 
     if prefix_state == PrefixState::Root {
-        let command = resolve_prefix_command(&key, &prefix);
+        let command = resolve_prefix_command_with_tmux_keys(&key, &prefix, &app.config.tmux_keys);
         if let Some(mux) = app.mux.as_mut() {
             mux.prefix_state = PrefixState::Idle;
         }
@@ -861,6 +881,10 @@ fn handle_attached_key(app: &mut App, key: KeyEvent) {
             Some(PrefixCommand::KillPane) => {
                 close_context_overlays(app);
                 kill_focused(app);
+            }
+            Some(PrefixCommand::EndPersistentSession) => {
+                close_context_overlays(app);
+                end_focused_tmux(app);
             }
             Some(PrefixCommand::Quit) => {
                 app.request_quit_from_pane();
@@ -1922,7 +1946,7 @@ pub fn handle_list_prefix(app: &mut App, key: KeyEvent) -> bool {
     if let Some(mux) = app.mux.as_mut() {
         mux.prefix_state = PrefixState::Idle;
     }
-    let command = resolve_prefix_command(&key, &prefix);
+    let command = resolve_prefix_command_with_tmux_keys(&key, &prefix, &app.config.tmux_keys);
     if matches!(command, Some(PrefixCommand::Help)) {
         if let Some(mux) = app.mux.as_mut() {
             mux.prefix_state = PrefixState::Help;
@@ -2008,6 +2032,7 @@ pub fn handle_list_prefix(app: &mut App, key: KeyEvent) -> bool {
             attach_focused(app);
         }
         Some(PrefixCommand::KillPane) => kill_focused(app),
+        Some(PrefixCommand::EndPersistentSession) => end_focused_tmux(app),
         Some(PrefixCommand::Cancel) | None => {}
     }
     true
@@ -2022,7 +2047,11 @@ fn attach_focused(app: &mut App) {
 }
 
 fn kill_focused(app: &mut App) {
-    let Some(id) = app.mux.as_ref().and_then(|mux| mux.focused) else {
+    let Some((id, title, persistent)) = app.mux.as_ref().and_then(|mux| {
+        let id = mux.focused?;
+        let pane = mux.pane(id)?;
+        Some((id, pane.title.clone(), app.pane_is_tmux_backed(pane)))
+    }) else {
         return;
     };
     if !app.forget_workspace_panels(id) {
@@ -2031,8 +2060,25 @@ fn kill_focused(app: &mut App) {
     if let Some(mux) = app.mux.as_mut() {
         mux.remove(id);
     }
+    app.status_message = Some(if persistent {
+        format!("Detached '{title}'; tmux session is still running")
+    } else {
+        format!("Ended '{title}'")
+    });
     sync_workspace_panels(app);
     sync_view(app);
+}
+
+fn end_focused_tmux(app: &mut App) {
+    let Some(session_id) = app
+        .mux
+        .as_ref()
+        .and_then(|mux| mux.focused_pane())
+        .map(|pane| pane.session_id.clone())
+    else {
+        return;
+    };
+    request_end_tmux_session(app, &session_id);
 }
 
 /// Keep the visible view consistent with the focused pane, falling back to the list.
@@ -3718,7 +3764,9 @@ mod tests {
 
         for id in [
             CommandId::NewSession,
+            CommandId::NewTmuxSession,
             CommandId::NewWorktreeSession,
+            CommandId::NewTmuxWorktreeSession,
             CommandId::OpenFavoriteTabs,
             CommandId::SearchSessions,
             CommandId::FilterProject,

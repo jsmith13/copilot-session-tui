@@ -17,8 +17,11 @@ pub enum CommandId {
     NextSession,
     PreviousSession,
     ResumeSelected,
+    ResumeSelectedInTmux,
     NewSession,
+    NewTmuxSession,
     NewWorktreeSession,
+    NewTmuxWorktreeSession,
     OpenSelectedScratchpad,
     ToggleFavorite,
     ReorderFavorite,
@@ -39,6 +42,7 @@ pub enum CommandId {
     OpenHelp,
     SendLiteralPrefix,
     EndSession,
+    EndPersistentSession,
     Quit,
 }
 
@@ -175,6 +179,24 @@ fn commands(app: &App) -> Vec<CommandEntry> {
         .is_some_and(|session| app.is_favorite(&session.id));
     let project = app.command_project().is_some();
     let session_dir = app.new_session_dir().is_some();
+    let tmux_supported = crate::session::tmux::supported_platform();
+    let tmux_new_shortcut = app.config.tmux_keys.new_session.clone();
+    let tmux_resume_shortcut = app.config.tmux_keys.resume_session.clone();
+    let tmux_worktree_shortcut = app.config.tmux_keys.new_worktree.clone();
+    let tmux_end_shortcut = format!(
+        "{} / C-b {}",
+        app.config.tmux_keys.end_session, app.config.tmux_keys.end_session
+    );
+    let tmux_target = match app.view {
+        View::Attached(_) => app
+            .mux
+            .as_ref()
+            .and_then(|mux| mux.focused_pane())
+            .is_some_and(|pane| app.pane_is_tmux_backed(pane)),
+        View::List => app
+            .selected_session()
+            .is_some_and(|session| app.session_is_tmux_backed(&session.id)),
+    };
 
     let mut commands = vec![
         entry(
@@ -277,6 +299,19 @@ fn commands(app: &App) -> Vec<CommandEntry> {
             "Available from the session list",
         ),
         entry(
+            Id::ResumeSelectedInTmux,
+            Group::Sessions,
+            "Resume selected session in tmux",
+            "Open the selected conversation in a persistent tmux session",
+            &tmux_resume_shortcut,
+            list && selected && tmux_supported,
+            if tmux_supported {
+                "Available for a selected session in the list"
+            } else {
+                "tmux requires a Unix-like operating system"
+            },
+        ),
+        entry(
             Id::NewSession,
             Group::Sessions,
             "New session",
@@ -286,6 +321,19 @@ fn commands(app: &App) -> Vec<CommandEntry> {
             "No session directory is available",
         ),
         entry(
+            Id::NewTmuxSession,
+            Group::Sessions,
+            "New tmux session",
+            "Start a persistent Copilot session backed by tmux",
+            &tmux_new_shortcut,
+            session_dir && tmux_supported,
+            if tmux_supported {
+                "No session directory is available"
+            } else {
+                "tmux requires a Unix-like operating system"
+            },
+        ),
+        entry(
             Id::NewWorktreeSession,
             Group::Sessions,
             "New worktree session",
@@ -293,6 +341,19 @@ fn commands(app: &App) -> Vec<CommandEntry> {
             "N",
             project,
             "No Git project is available",
+        ),
+        entry(
+            Id::NewTmuxWorktreeSession,
+            Group::Sessions,
+            "New tmux worktree session",
+            "Create an isolated persistent session backed by tmux",
+            &tmux_worktree_shortcut,
+            project && tmux_supported,
+            if tmux_supported {
+                "No Git project is available"
+            } else {
+                "tmux requires a Unix-like operating system"
+            },
         ),
         entry(
             Id::OpenSelectedScratchpad,
@@ -473,11 +534,20 @@ fn commands(app: &App) -> Vec<CommandEntry> {
         entry(
             Id::EndSession,
             Group::Lifecycle,
-            "End focused session",
-            "Terminate the focused Copilot pane",
+            "Close focused session tab",
+            "End a CST-owned session or detach a tmux-backed session",
             "C-b x",
             attached && running_pane,
             "Requires an attached running session",
+        ),
+        entry(
+            Id::EndPersistentSession,
+            Group::Lifecycle,
+            "End persistent tmux session",
+            "Stop Copilot and remove its tmux ownership",
+            &tmux_end_shortcut,
+            tmux_target,
+            "Requires a tmux-backed session",
         ),
         entry(
             Id::Quit,
@@ -531,8 +601,11 @@ fn command_keywords(id: CommandId) -> &'static str {
         SwitchSession | NextSession | PreviousSession => "pane tab mux",
         MoveTab => "reorder move tab drag arrange",
         ResumeSelected => "attach open",
+        ResumeSelectedInTmux => "attach open persistent tmux tab",
         NewSession => "create copilot",
+        NewTmuxSession => "create copilot persistent tmux tab",
         NewWorktreeSession => "create branch isolated git",
+        NewTmuxWorktreeSession => "create branch isolated git persistent tmux tab",
         ToggleFavorite | ReorderFavorite | OpenFavoriteTabs => "star pin windows terminal",
         RenameSelected => "name edit",
         DeleteSelected => "remove worktree",
@@ -547,7 +620,8 @@ fn command_keywords(id: CommandId) -> &'static str {
         WhatsNew => "changelog release notes updates version history",
         OpenHelp => "shortcuts documentation",
         SendLiteralPrefix => "raw control key",
-        EndSession => "kill stop terminate",
+        EndSession => "close detach tab",
+        EndPersistentSession => "kill stop terminate persistent tmux",
         Quit => "exit close",
     }
 }

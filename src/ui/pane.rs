@@ -1074,8 +1074,12 @@ mod tests {
         let text = render(&mut app);
 
         assert!(
-            text.contains("Quit and end 1 running session(s)?"),
+            text.contains("Quit with 1 running session(s)?"),
             "prefix q must be answerable from the pane it was pressed in, got:\n{text}"
+        );
+        assert!(
+            text.contains("1 CST-owned session(s) will end"),
+            "got:\n{text}"
         );
         let _ = app.mux.as_mut().expect("mux").shutdown();
     }

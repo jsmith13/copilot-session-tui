@@ -30,6 +30,7 @@ fn draw_prefix_menu(f: &mut Frame, app: &App) {
         .as_ref()
         .map(|mux| mux.prefix.label())
         .unwrap_or_else(|| "C-b".to_string());
+    let tmux_end = app.config.tmux_keys.end_session.as_str();
     let block = Block::default()
         .title(format!(" {prefix} · Commands "))
         .borders(Borders::ALL)
@@ -63,9 +64,9 @@ fn draw_prefix_menu(f: &mut Frame, app: &App) {
             vec![
                 ("w", "Switch"),
                 ("n / p", "Next / previous"),
-                ("1–9", "Jump to pane"),
+                ("m", "Move tab"),
+                ("1-9", "Jump to tab"),
                 ("d", "Session list"),
-                ("Esc", "Close menu"),
             ],
         ),
         (
@@ -81,9 +82,9 @@ fn draw_prefix_menu(f: &mut Frame, app: &App) {
         (
             "Lifecycle",
             vec![
-                ("x", "End session"),
+                ("x", "Close session tab"),
+                (tmux_end, "End persistent session"),
                 ("q", "Quit CST"),
-                ("", ""),
                 ("", ""),
                 ("", ""),
             ],

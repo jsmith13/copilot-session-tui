@@ -1,6 +1,7 @@
 pub mod loader;
 pub mod manager;
 pub mod process;
+pub mod tmux;
 pub mod worktree;
 
 use chrono::{DateTime, Utc};

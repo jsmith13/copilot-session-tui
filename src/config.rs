@@ -173,6 +173,9 @@ pub struct UserConfig {
     pub mux_prefix: String,
 
     #[serde(default)]
+    pub tmux_keys: TmuxKeyConfig,
+
+    #[serde(default)]
     pub worktree: WorktreeConfig,
 
     #[serde(default)]
@@ -199,6 +202,47 @@ pub struct TerminalConfig {
     pub shell: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TmuxKeyConfig {
+    #[serde(default = "default_tmux_resume_key")]
+    pub resume_session: String,
+    #[serde(default = "default_tmux_new_key")]
+    pub new_session: String,
+    #[serde(default = "default_tmux_worktree_key")]
+    pub new_worktree: String,
+    #[serde(default = "default_tmux_end_key")]
+    pub end_session: String,
+}
+
+impl TmuxKeyConfig {
+    pub fn matches_resume_session(&self, code: crossterm::event::KeyCode) -> bool {
+        matches_key(code, &self.resume_session)
+    }
+
+    pub fn matches_new_session(&self, code: crossterm::event::KeyCode) -> bool {
+        matches_key(code, &self.new_session)
+    }
+
+    pub fn matches_new_worktree(&self, code: crossterm::event::KeyCode) -> bool {
+        matches_key(code, &self.new_worktree)
+    }
+
+    pub fn matches_end_session(&self, code: crossterm::event::KeyCode) -> bool {
+        matches_key(code, &self.end_session)
+    }
+}
+
+impl Default for TmuxKeyConfig {
+    fn default() -> Self {
+        Self {
+            resume_session: default_tmux_resume_key(),
+            new_session: default_tmux_new_key(),
+            new_worktree: default_tmux_worktree_key(),
+            end_session: default_tmux_end_key(),
+        }
+    }
+}
+
 /// Keeps the default out of a written `config.json`, so the file stays a record of what
 /// the user actually chose rather than a snapshot of every default.
 fn is_true(value: &bool) -> bool {
@@ -207,6 +251,35 @@ fn is_true(value: &bool) -> bool {
 
 fn default_mux_prefix() -> String {
     DEFAULT_MUX_PREFIX.to_string()
+}
+
+fn default_tmux_resume_key() -> String {
+    "t".to_string()
+}
+
+fn default_tmux_new_key() -> String {
+    "m".to_string()
+}
+
+fn default_tmux_worktree_key() -> String {
+    "M".to_string()
+}
+
+fn default_tmux_end_key() -> String {
+    "X".to_string()
+}
+
+fn matches_key(code: crossterm::event::KeyCode, configured: &str) -> bool {
+    configured_key_code(configured) == Some(code)
+}
+
+fn configured_key_code(configured: &str) -> Option<crossterm::event::KeyCode> {
+    let mut characters = configured.chars();
+    let expected = characters.next()?;
+    characters
+        .next()
+        .is_none()
+        .then_some(crossterm::event::KeyCode::Char(expected))
 }
 
 fn default_ntfy_server() -> String {
@@ -322,6 +395,7 @@ impl Default for UserConfig {
             github_comment_filter: GithubCommentFilter::All,
             mux: false,
             mux_prefix: default_mux_prefix(),
+            tmux_keys: TmuxKeyConfig::default(),
             worktree: WorktreeConfig::default(),
             terminal: TerminalConfig::default(),
             notifications: NotificationConfig::default(),
@@ -632,6 +706,10 @@ pub fn load() -> UserConfig {
     let config_path = config_path();
     let snippets_path = global_snippets_path();
     let mut config = load_base_config(&config_path).unwrap_or_default();
+    if let Err(error) = validate_tmux_keys(&config.tmux_keys) {
+        eprintln!("Warning: invalid tmux shortcut configuration: {error}; using defaults");
+        config.tmux_keys = TmuxKeyConfig::default();
+    }
     // A damaged sidecar must not make unrelated settings/favorites fall back to
     // defaults and later overwrite a valid config.json.
     let _ = overlay_global_snippets(&mut config, &snippets_path);
@@ -668,6 +746,7 @@ fn content_revision(content: &[u8]) -> ConfigRevision {
 
 fn load_checked_in(config_path: &Path, snippets_path: &Path) -> Result<UserConfig> {
     let mut config = load_base_config(config_path)?;
+    validate_tmux_keys(&config.tmux_keys)?;
     overlay_global_snippets(&mut config, snippets_path)?;
     Ok(config)
 }
@@ -841,6 +920,83 @@ pub fn validate_user_notification_config(config: &UserConfig) -> Result<()> {
     validate_notification_config(&config.notifications)?;
     if config.notifications.enabled {
         validate_ntfy_access_token(config.ntfy_access_token.trim())?;
+    }
+    Ok(())
+}
+
+pub fn validate_tmux_keys(keys: &TmuxKeyConfig) -> Result<()> {
+    let configured = [
+        ("resume_session", keys.resume_session.as_str(), false),
+        ("new_session", keys.new_session.as_str(), false),
+        ("new_worktree", keys.new_worktree.as_str(), false),
+        ("end_session", keys.end_session.as_str(), true),
+    ];
+    let mut seen = BTreeSet::new();
+    for (name, value, used_after_prefix) in configured {
+        let mut characters = value.chars();
+        let Some(character) = characters.next() else {
+            anyhow::bail!("tmux_keys.{name} must be one printable character");
+        };
+        if characters.next().is_some()
+            || character.is_control()
+            || character.is_whitespace()
+            || !character.is_ascii()
+        {
+            anyhow::bail!("tmux_keys.{name} must be one printable ASCII character");
+        }
+        if !seen.insert(character) {
+            anyhow::bail!("tmux shortcut '{character}' is assigned more than once");
+        }
+        if !used_after_prefix
+            && matches!(
+                character,
+                'q' | 'k'
+                    | 'j'
+                    | 'r'
+                    | 'e'
+                    | 'g'
+                    | 'T'
+                    | ' '
+                    | 'd'
+                    | 'f'
+                    | 'p'
+                    | 's'
+                    | 'c'
+                    | 'n'
+                    | 'N'
+                    | '?'
+                    | ','
+                    | '.'
+                    | 'u'
+            )
+        {
+            anyhow::bail!(
+                "tmux shortcut '{character}' conflicts with an existing session-list command"
+            );
+        }
+        if used_after_prefix
+            && matches!(
+                character,
+                'd' | 'n'
+                    | 'p'
+                    | 'x'
+                    | 'w'
+                    | 'c'
+                    | 'e'
+                    | 't'
+                    | 's'
+                    | 'u'
+                    | 'q'
+                    | 'm'
+                    | 'h'
+                    | 'g'
+                    | '0'..='9'
+            )
+        {
+            anyhow::bail!(
+                "tmux shortcut '{character}' conflicts with an existing multiplexer command"
+            );
+        }
     }
     Ok(())
 }
@@ -1311,6 +1467,25 @@ mod tests {
         assert!(validate_user_notification_config(&config).is_err());
         config.ntfy_access_token = "tk_valid-token_123".to_string();
         assert!(validate_user_notification_config(&config).is_ok());
+    }
+
+    #[test]
+    fn tmux_shortcuts_are_single_distinct_printable_characters() {
+        assert!(validate_tmux_keys(&TmuxKeyConfig::default()).is_ok());
+
+        let duplicate = TmuxKeyConfig {
+            resume_session: "t".to_string(),
+            new_session: "z".to_string(),
+            new_worktree: "z".to_string(),
+            end_session: "X".to_string(),
+        };
+        assert!(validate_tmux_keys(&duplicate).is_err());
+
+        let invalid = TmuxKeyConfig {
+            new_session: "mm".to_string(),
+            ..TmuxKeyConfig::default()
+        };
+        assert!(validate_tmux_keys(&invalid).is_err());
     }
 
     #[test]

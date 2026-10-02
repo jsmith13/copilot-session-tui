@@ -6,6 +6,8 @@ use std::sync::OnceLock;
 
 use crate::config::{EffectiveWorktreeConfig, UserConfig};
 
+use super::tmux;
+pub use super::tmux::TmuxSessionRef;
 use super::worktree::{self, ManagedWorktree};
 
 fn apply_args(cmd: &mut Command, args: Vec<String>) {
@@ -249,6 +251,27 @@ pub fn start_new_session(cwd: &str, config: &UserConfig) -> Result<()> {
     Ok(())
 }
 
+/// Start a new Copilot conversation owned by a persistent tmux session.
+pub fn start_tmux_session(cwd: &Path, title: &str, config: &UserConfig) -> Result<TmuxSessionRef> {
+    let (program, args, session_id) = new_session_command(config, cwd)?;
+    tmux::launch(cwd, title, &program, &args, &session_id)
+}
+
+/// Resume an existing Copilot conversation owned by a persistent tmux session.
+pub fn resume_tmux_session(
+    session_id: &str,
+    cwd: &Path,
+    title: &str,
+    config: &UserConfig,
+) -> Result<TmuxSessionRef> {
+    let (program, args) = resume_command(session_id, config, cwd)?;
+    tmux::launch(cwd, title, &program, &args, session_id)
+}
+
+pub fn attach_tmux_session(reference: &TmuxSessionRef) -> Result<()> {
+    tmux::attach_foreground(reference)
+}
+
 pub fn start_worktree_session(
     project: &str,
     branch: &str,
@@ -286,6 +309,39 @@ pub fn start_worktree_session(
     }
 
     Ok(created.entry.path)
+}
+
+pub fn start_worktree_tmux_session(
+    project: &str,
+    branch: &str,
+    worktree_config: &EffectiveWorktreeConfig,
+    config: &UserConfig,
+) -> Result<TmuxSessionRef> {
+    let created = worktree::create_managed_worktree(Path::new(project), branch, worktree_config)?;
+
+    if let Some(ref notice) = created.notice {
+        eprintln!("Notice: {notice}");
+    }
+    eprintln!(
+        "Starting isolated tmux session on '{}' in {}...",
+        branch,
+        created.entry.path.display()
+    );
+
+    match start_tmux_session(&created.entry.path, branch, config) {
+        Ok(reference) => Ok(reference),
+        Err(error) => {
+            let rollback = worktree::rollback_created_worktree(&created.entry);
+            Err(match rollback {
+                Ok(()) => error.context(
+                    "Failed to launch Copilot in tmux; worktree creation was rolled back",
+                ),
+                Err(rollback_error) => error.context(format!(
+                    "Failed to launch Copilot in tmux, and worktree rollback also failed: {rollback_error}"
+                )),
+            })
+        }
+    }
 }
 
 /// Locate the Copilot binary, caching the result.
