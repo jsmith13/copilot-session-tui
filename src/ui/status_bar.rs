@@ -40,6 +40,14 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             key_span("Esc", theme),
             Span::raw(" cancel"),
         ]),
+        // A grabbed favorite remaps most keys, so the usual hints would lie.
+        Mode::Normal if app.grabbed_favorite.is_some() => Line::from(vec![
+            Span::raw(" "),
+            key_span("↑↓", theme),
+            Span::raw(" Move favorite  "),
+            key_span("Enter/g", theme),
+            Span::raw(" Drop & save"),
+        ]),
         Mode::Normal => {
             let mut spans = vec![
                 Span::raw(" "),
@@ -47,12 +55,12 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
                 Span::raw(" Navigate  "),
                 key_span("Enter", theme),
                 Span::raw(" Resume  "),
+                key_span("n", theme),
+                Span::raw(" New  "),
                 key_span("r", theme),
                 Span::raw(" Rename  "),
                 key_span("d", theme),
                 Span::raw(" Delete  "),
-                key_span("e", theme),
-                Span::raw(" Scratchpad  "),
                 key_span("/", theme),
                 Span::raw(" Search  "),
                 key_span("f", theme),
@@ -109,17 +117,23 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let line2 = match app.mode {
-        Mode::Normal => {
+        Mode::Normal if app.grabbed_favorite.is_none() => {
             let mut spans = vec![
                 Span::raw(" "),
-                key_span("c", theme),
-                Span::raw(" Clear filter  "),
-                key_span("n", theme),
-                Span::raw(" New  "),
-                key_span("N", theme),
-                Span::raw(" Worktree  "),
                 key_span("Space", theme),
                 Span::raw(" Favorite  "),
+            ];
+            // Keys that cannot do anything right now stay out of the bar; the full
+            // list lives behind `?`.
+            if app.selected_favorite_reorderable() {
+                spans.push(key_span("g", theme));
+                spans.push(Span::raw(" Reorder  "));
+            }
+            if app.project_filter.is_some() {
+                spans.push(key_span("c", theme));
+                spans.push(Span::raw(" Clear filter  "));
+            }
+            spans.extend([
                 key_span("T", theme),
                 Span::raw(" Favorite tabs  "),
                 key_span(",", theme),
@@ -130,7 +144,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
                 Span::raw(" Help  "),
                 key_span("q", theme),
                 Span::raw(" Quit"),
-            ];
+            ]);
             if let Some(info) = app
                 .update_info
                 .as_ref()
@@ -210,24 +224,108 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    #[test]
-    fn session_list_footer_advertises_favorite_tabs_shortcut() {
-        let app = App::new(Vec::new(), UserConfig::default());
+    fn rendered(app: &App) -> String {
         let backend = TestBackend::new(180, 2);
         let mut terminal = Terminal::new(backend).unwrap();
-
         terminal
-            .draw(|frame| draw(frame, &app, frame.area()))
+            .draw(|frame| draw(frame, app, frame.area()))
             .unwrap();
-
-        let text = terminal
+        terminal
             .backend()
             .buffer()
             .content()
             .iter()
             .map(|cell| cell.symbol())
-            .collect::<String>();
+            .collect()
+    }
+
+    fn session(id: &str) -> crate::session::Session {
+        crate::session::Session {
+            id: id.to_string(),
+            cwd: "C:/Workspace/zazen".to_string(),
+            project_root: "C:/Workspace/zazen".to_string(),
+            summary: Some(id.to_string()),
+            created_at: None,
+            updated_at: None,
+            is_active: false,
+            dir_path: std::path::PathBuf::from("."),
+            edited_files: Vec::new(),
+            last_user_message: None,
+            turn_count: 0,
+            tool_call_count: 0,
+            details_parsed_len: 0,
+        }
+    }
+
+    #[test]
+    fn session_list_footer_advertises_favorite_tabs_shortcut() {
+        let app = App::new(Vec::new(), UserConfig::default());
+        let text = rendered(&app);
         assert!(text.contains("T Favorite tabs"), "got:\n{text}");
+    }
+
+    #[test]
+    fn footer_keeps_rare_keys_behind_the_help_screen() {
+        let app = App::new(Vec::new(), UserConfig::default());
+        let text = rendered(&app);
+        assert!(text.contains("n New"), "got:\n{text}");
+        assert!(
+            !text.contains("Scratchpad") && !text.contains("N Worktree"),
+            "rarely used keys belong in ? instead of the footer:\n{text}"
+        );
+    }
+
+    #[test]
+    fn clear_filter_hint_appears_only_while_a_filter_is_active() {
+        let mut app = App::new(vec![session("a")], UserConfig::default());
+        app.disable_config_persistence();
+        assert!(
+            !rendered(&app).contains("c Clear filter"),
+            "there is nothing to clear yet"
+        );
+
+        app.set_project_filter(Some("C:/Workspace/zazen".to_string()));
+        assert!(rendered(&app).contains("c Clear filter"));
+    }
+
+    #[test]
+    fn reorder_hint_appears_only_while_a_reorderable_favorite_is_selected() {
+        let config = UserConfig {
+            favorites: vec!["fav".to_string()],
+            ..UserConfig::default()
+        };
+        let mut app = App::new(vec![session("fav"), session("plain")], config);
+        app.disable_config_persistence();
+
+        // Favorites sort first, so selection 0 is the favorite.
+        app.selected = 0;
+        assert!(rendered(&app).contains("g Reorder"));
+
+        app.selected = 1;
+        assert!(
+            !rendered(&app).contains("g Reorder"),
+            "g does nothing on a non-favorite, so it must not be advertised"
+        );
+    }
+
+    #[test]
+    fn footer_swaps_to_move_hints_while_a_favorite_is_grabbed() {
+        let config = UserConfig {
+            favorites: vec!["fav".to_string()],
+            ..UserConfig::default()
+        };
+        let mut app = App::new(vec![session("fav")], config);
+        app.disable_config_persistence();
+        app.selected = 0;
+        app.toggle_favorite_grab();
+        assert!(app.grabbed_favorite.is_some());
+
+        let text = rendered(&app);
+        assert!(text.contains("Move favorite"), "got:\n{text}");
+        assert!(
+            !text.contains("Enter Resume"),
+            "Enter drops the favorite here, it does not resume:\n{text}"
+        );
     }
 
     #[test]
