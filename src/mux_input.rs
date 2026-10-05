@@ -936,6 +936,10 @@ fn handle_attached_key(app: &mut App, key: KeyEvent) {
         ) {
             // A dead pane keeps its final screen until dismissed.
             kill_focused(app);
+        } else if matches!(key.code, crossterm::event::KeyCode::Char('r' | 'R')) {
+            // Only reachable once the session is dead, so this cannot swallow an
+            // ordinary keystroke meant for Copilot.
+            restart_focused(app);
         }
     }
 }
@@ -2032,6 +2036,62 @@ fn kill_focused(app: &mut App) {
         mux.remove(id);
     }
     sync_workspace_panels(app);
+    sync_view(app);
+}
+
+/// Everything needed to resurrect the focused pane as a fresh resume of its session.
+struct RestartTarget {
+    pane_id: crate::mux::PaneId,
+    session_id: String,
+    cwd: String,
+    title: String,
+    /// Slot in the tab strip, so the restarted pane lands where the dead one sat.
+    index: usize,
+}
+
+/// Restart is only offered on a pane whose session has exited: while the child is
+/// alive every key belongs to Copilot, and `r` is ordinary typing.
+fn restart_target(app: &App) -> Option<RestartTarget> {
+    let mux = app.mux.as_ref()?;
+    let pane = mux.focused_pane()?;
+    if pane.is_running() {
+        return None;
+    }
+    let index = mux.panes.iter().position(|entry| entry.id == pane.id)?;
+    Some(RestartTarget {
+        pane_id: pane.id,
+        session_id: pane.session_id.clone(),
+        cwd: pane.cwd.to_string_lossy().into_owned(),
+        title: pane.title.clone(),
+        index,
+    })
+}
+
+/// Resume the focused dead pane's session in place, instead of making the user close
+/// the pane, find the session in the list, and open it again.
+fn restart_focused(app: &mut App) {
+    let Some(target) = restart_target(app) else {
+        return;
+    };
+    // Same contract as closing: a scratchpad that cannot be saved keeps its pane.
+    if !app.forget_workspace_panels(target.pane_id) {
+        return;
+    }
+    match app.attach_session(&target.session_id, &target.cwd, target.title) {
+        Ok(()) => {
+            // attach_session drops the dead pane and appends the new one; put it back
+            // in the old slot so the tab strip does not reshuffle under the user.
+            if let Some(mux) = app.mux.as_mut() {
+                if let Some(id) = mux.focused {
+                    mux.move_pane_to(id, target.index);
+                }
+            }
+            sync_workspace_panels(app);
+        }
+        Err(error) => {
+            app.status_message = Some(format!("Cannot restart session: {error}"));
+        }
+    }
     sync_view(app);
 }
 
@@ -5427,6 +5487,208 @@ mod tests {
 
         assert!(handle_mux_event(&mut app, MuxEvent::Exited(2, Some(0))));
         assert!(app.host_sequences.is_empty());
+    }
+
+    #[test]
+    fn a_running_pane_never_offers_a_restart_target_because_r_there_is_ordinary_typing() {
+        let mut app = attached_mux_app("alive");
+        assert!(restart_target(&app).is_none());
+        let _ = app.mux.as_mut().unwrap().shutdown();
+    }
+
+    /// The whole journey from the bug report, against the real binary: Copilot crashes,
+    /// the dead pane offers `r`, and pressing it brings the same session back in place.
+    /// Everything between the keystroke and the resumed child is real — the PTY, the
+    /// key routing, `attach_session`, the PATH lookup, the spawn.
+    ///
+    /// Hermetic despite being live: `--copilot-home` points into a sandbox and a
+    /// compiled stand-in `copilot` sits first on PATH, so nothing reads the real
+    /// session list and no AI credit is spent. The stand-in crashes its first launch
+    /// with code 134 — the OOM exit this feature was built for — and stays alive when
+    /// resumed. PATH is changed process-wide, which is safe here because every other
+    /// ignored test gates itself off unless its own env var is set.
+    ///
+    /// One known leak: the What's new marker lives in the real local data dir, not
+    /// under the Copilot home, so a run on a machine whose marker is older than this
+    /// build advances it. The screen stays reachable from the command palette.
+    #[test]
+    #[ignore = "drives the real cst binary in a PTY; run with CST_RESTART_E2E=1"]
+    fn a_crashed_session_really_restarts_in_place_when_r_is_pressed() {
+        use std::sync::mpsc::{self, Receiver};
+        use std::time::{Duration, Instant};
+
+        if std::env::var_os("CST_RESTART_E2E").is_none() {
+            return;
+        }
+
+        // target/debug/deps/<test>-<hash>.exe -> target/debug/<bin>.
+        let mut dir = std::env::current_exe().expect("test executable path");
+        dir.pop();
+        if dir.ends_with("deps") {
+            dir.pop();
+        }
+        let cst = dir.join(format!(
+            "copilot-session-tui{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        assert!(
+            cst.exists(),
+            "the cst binary must exist at {} (cargo test builds it)",
+            cst.display()
+        );
+
+        let sandbox = tempfile::tempdir().expect("sandbox directory");
+        let home = sandbox.path().join("home");
+        std::fs::create_dir_all(home.join("session-state")).unwrap();
+        let bin = sandbox.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let log = sandbox.path().join("invocations.log");
+
+        let shim_src = sandbox.path().join("copilot_shim.rs");
+        std::fs::write(
+            &shim_src,
+            r#"
+use std::io::Write;
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Ok(log) = std::env::var("CST_E2E_LOG") {
+        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(log).unwrap();
+        writeln!(file, "{}", args.join(" ")).unwrap();
+    }
+    if args.iter().any(|arg| arg == "--version") {
+        println!("1.99.0 (fake copilot for the CST restart e2e)");
+        return;
+    }
+    if args.iter().any(|arg| arg.starts_with("--session-id=")) {
+        println!("FAKE COPILOT STARTED");
+        std::io::stdout().flush().unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        std::process::exit(134);
+    }
+    if let Some(id) = args.iter().find_map(|arg| arg.strip_prefix("--resume=")) {
+        println!("FAKE COPILOT RESUMED {id}");
+        std::io::stdout().flush().unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(600));
+        return;
+    }
+    std::process::exit(1);
+}
+"#,
+        )
+        .unwrap();
+        let compiled = std::process::Command::new("rustc")
+            .arg(&shim_src)
+            .arg("-o")
+            .arg(bin.join(format!("copilot{}", std::env::consts::EXE_SUFFIX)))
+            .status()
+            .expect("rustc must be available to build the stand-in Copilot");
+        assert!(compiled.success(), "stand-in Copilot failed to compile");
+
+        let path = std::env::join_paths(std::iter::once(bin.clone()).chain(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        )))
+        .unwrap();
+        std::env::set_var("PATH", &path);
+        std::env::set_var("CST_E2E_LOG", &log);
+
+        let (tx, rx) = mpsc::channel();
+        let mut pane = Pane::spawn(
+            PaneSpec {
+                id: 1,
+                title: "e2e driver".to_string(),
+                cwd: sandbox.path().to_path_buf(),
+                session_id: "e2e-driver".to_string(),
+                program: cst.to_string_lossy().into_owned(),
+                args: vec![
+                    "--mux".to_string(),
+                    "--copilot-home".to_string(),
+                    home.to_string_lossy().into_owned(),
+                ],
+                events_path: None,
+                terminal_light_mode: Some(false),
+                hooks_active: false,
+            },
+            35,
+            120,
+            tx,
+        )
+        .expect("cst must start inside the PTY");
+
+        fn wait_for(pane: &Pane, rx: &Receiver<MuxEvent>, needle: &str) -> String {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut contents = String::new();
+            while Instant::now() < deadline {
+                let _ = rx.recv_timeout(Duration::from_millis(200));
+                contents = pane.with_screen(|screen| screen.contents()).unwrap();
+                if contents.contains(needle) {
+                    return contents;
+                }
+            }
+            panic!("never saw {needle:?} on screen; last frame:\n{contents}");
+        }
+
+        wait_for(&pane, &rx, "Start a new session here");
+        // A machine whose last-ran marker is older than this build gets the What's
+        // new screen on top of the list; it eats every key until dismissed.
+        if pane
+            .with_screen(|screen| screen.contents())
+            .unwrap()
+            .contains("What's new")
+        {
+            pane.send_key(&KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                let _ = rx.recv_timeout(Duration::from_millis(200));
+                let contents = pane.with_screen(|screen| screen.contents()).unwrap();
+                if !contents.contains("What's new") {
+                    break;
+                }
+            }
+        }
+        pane.send_key(&KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
+            .unwrap();
+        wait_for(&pane, &rx, "FAKE COPILOT STARTED");
+        wait_for(&pane, &rx, "exited with code 134");
+        wait_for(&pane, &rx, "r restart");
+        pane.send_key(&KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE))
+            .unwrap();
+        wait_for(&pane, &rx, "FAKE COPILOT RESUMED");
+
+        let invocations = std::fs::read_to_string(&log).unwrap();
+        let crashed = invocations
+            .lines()
+            .find_map(|line| {
+                line.split_whitespace()
+                    .find_map(|arg| arg.strip_prefix("--session-id="))
+            })
+            .expect("the crashed launch must have been given a session id")
+            .to_string();
+        assert!(
+            invocations.contains(&format!("--resume={crashed}")),
+            "r must resume the very session that crashed: {invocations}"
+        );
+
+        let _ = pane.kill();
+    }
+
+    #[test]
+    fn a_dead_pane_offers_its_session_for_restart_keeping_its_slot_in_the_tab_strip() {
+        let mut app = attached_mux_app("one");
+        push_test_pane(&mut app, 2, "crashed");
+        push_test_pane(&mut app, 3, "three");
+        app.mux.as_mut().unwrap().focused = Some(2);
+
+        handle_mux_event(&mut app, MuxEvent::Exited(2, Some(134)));
+
+        let target = restart_target(&app).expect("an exited pane is restartable");
+        assert_eq!(target.session_id, "crashed");
+        assert_eq!(target.title, "Test session 2");
+        assert_eq!(
+            target.index, 1,
+            "the restarted pane must land back where the dead one sat, not at the end"
+        );
+        let _ = app.mux.as_mut().unwrap().shutdown();
     }
     fn tab_order(app: &App) -> Vec<String> {
         app.mux

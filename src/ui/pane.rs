@@ -262,7 +262,7 @@ pub fn draw_status(f: &mut Frame, app: &App, area: Rect) {
                 Some(code) => format!("exited with code {code}"),
             };
             vec![Span::styled(
-                format!(" {text} — Enter to close "),
+                format!(" {text} — r restart · Enter close "),
                 Style::default().fg(theme.warning),
             )]
         }
