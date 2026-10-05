@@ -936,6 +936,10 @@ fn handle_attached_key(app: &mut App, key: KeyEvent) {
         ) {
             // A dead pane keeps its final screen until dismissed.
             kill_focused(app);
+        } else if matches!(key.code, crossterm::event::KeyCode::Char('r' | 'R')) {
+            // Only reachable once the session is dead, so this cannot swallow an
+            // ordinary keystroke meant for Copilot.
+            restart_focused(app);
         }
     }
 }
@@ -2032,6 +2036,62 @@ fn kill_focused(app: &mut App) {
         mux.remove(id);
     }
     sync_workspace_panels(app);
+    sync_view(app);
+}
+
+/// Everything needed to resurrect the focused pane as a fresh resume of its session.
+struct RestartTarget {
+    pane_id: crate::mux::PaneId,
+    session_id: String,
+    cwd: String,
+    title: String,
+    /// Slot in the tab strip, so the restarted pane lands where the dead one sat.
+    index: usize,
+}
+
+/// Restart is only offered on a pane whose session has exited: while the child is
+/// alive every key belongs to Copilot, and `r` is ordinary typing.
+fn restart_target(app: &App) -> Option<RestartTarget> {
+    let mux = app.mux.as_ref()?;
+    let pane = mux.focused_pane()?;
+    if pane.is_running() {
+        return None;
+    }
+    let index = mux.panes.iter().position(|entry| entry.id == pane.id)?;
+    Some(RestartTarget {
+        pane_id: pane.id,
+        session_id: pane.session_id.clone(),
+        cwd: pane.cwd.to_string_lossy().into_owned(),
+        title: pane.title.clone(),
+        index,
+    })
+}
+
+/// Resume the focused dead pane's session in place, instead of making the user close
+/// the pane, find the session in the list, and open it again.
+fn restart_focused(app: &mut App) {
+    let Some(target) = restart_target(app) else {
+        return;
+    };
+    // Same contract as closing: a scratchpad that cannot be saved keeps its pane.
+    if !app.forget_workspace_panels(target.pane_id) {
+        return;
+    }
+    match app.attach_session(&target.session_id, &target.cwd, target.title) {
+        Ok(()) => {
+            // attach_session drops the dead pane and appends the new one; put it back
+            // in the old slot so the tab strip does not reshuffle under the user.
+            if let Some(mux) = app.mux.as_mut() {
+                if let Some(id) = mux.focused {
+                    mux.move_pane_to(id, target.index);
+                }
+            }
+            sync_workspace_panels(app);
+        }
+        Err(error) => {
+            app.status_message = Some(format!("Cannot restart session: {error}"));
+        }
+    }
     sync_view(app);
 }
 
@@ -5427,6 +5487,32 @@ mod tests {
 
         assert!(handle_mux_event(&mut app, MuxEvent::Exited(2, Some(0))));
         assert!(app.host_sequences.is_empty());
+    }
+
+    #[test]
+    fn a_running_pane_never_offers_a_restart_target_because_r_there_is_ordinary_typing() {
+        let mut app = attached_mux_app("alive");
+        assert!(restart_target(&app).is_none());
+        let _ = app.mux.as_mut().unwrap().shutdown();
+    }
+
+    #[test]
+    fn a_dead_pane_offers_its_session_for_restart_keeping_its_slot_in_the_tab_strip() {
+        let mut app = attached_mux_app("one");
+        push_test_pane(&mut app, 2, "crashed");
+        push_test_pane(&mut app, 3, "three");
+        app.mux.as_mut().unwrap().focused = Some(2);
+
+        handle_mux_event(&mut app, MuxEvent::Exited(2, Some(134)));
+
+        let target = restart_target(&app).expect("an exited pane is restartable");
+        assert_eq!(target.session_id, "crashed");
+        assert_eq!(target.title, "Test session 2");
+        assert_eq!(
+            target.index, 1,
+            "the restarted pane must land back where the dead one sat, not at the end"
+        );
+        let _ = app.mux.as_mut().unwrap().shutdown();
     }
     fn tab_order(app: &App) -> Vec<String> {
         app.mux
