@@ -4,7 +4,7 @@ use crate::mux::{KeyChord, MuxState, Pane, PaneSpec, PrefixState};
 use crate::notifications::{NotificationKind, NotificationRequest, NotificationWorker};
 use crate::scratchpad::Scratchpad;
 use crate::session::manager;
-use crate::session::tmux::{self, TmuxSessionRef};
+use crate::session::tmux::{self, TmuxSessionRef, TmuxSupport};
 use crate::session::worktree::ManagedWorktree;
 use crate::session::Session;
 use crate::snippets::{SnippetModal, SnippetUpdate};
@@ -730,7 +730,11 @@ pub struct App {
     /// Present only when multiplexing is enabled; owns every live pane.
     pub mux: Option<MuxState>,
     tmux_sessions: HashMap<String, TmuxSessionRef>,
+    /// Decided once at startup; every surface that offers a tmux action consults this
+    /// instead of probing the system, so tests can state either answer anywhere.
+    pub tmux_support: TmuxSupport,
     next_tmux_refresh: Instant,
+    last_tmux_refresh_error: Option<String>,
     pub confirm_end_tmux: Option<TmuxSessionRef>,
     pub view: View,
     /// Rows/cols available to a pane, kept in sync with the terminal size.
@@ -894,7 +898,9 @@ impl App {
             pending_takeover: None,
             mux,
             tmux_sessions: HashMap::new(),
+            tmux_support: TmuxSupport::detect(),
             next_tmux_refresh: Instant::now(),
+            last_tmux_refresh_error: None,
             confirm_end_tmux: None,
             view: View::List,
             pane_size: (24, 80),
@@ -1014,6 +1020,9 @@ impl App {
     }
 
     pub fn refresh_tmux_sessions(&mut self) -> bool {
+        if !self.tmux_support.is_available() {
+            return false;
+        }
         let now = Instant::now();
         if now < self.next_tmux_refresh {
             return false;
@@ -1021,6 +1030,7 @@ impl App {
         self.next_tmux_refresh = now + Duration::from_secs(2);
         match tmux::list_live() {
             Ok(references) => {
+                self.last_tmux_refresh_error = None;
                 let next: HashMap<_, _> = references
                     .into_iter()
                     .map(|reference| (reference.session_id.clone(), reference))
@@ -1033,7 +1043,16 @@ impl App {
                 }
             }
             Err(error) => {
-                self.status_message = Some(format!("Cannot refresh tmux sessions: {error}"));
+                // A persistent failure (held lock, broken tmux) would otherwise
+                // repaint this same message every two seconds forever, burying every
+                // other notice. Mention each distinct failure once and slow down;
+                // the next success resets both.
+                self.next_tmux_refresh = now + Duration::from_secs(30);
+                let message = error.to_string();
+                if self.last_tmux_refresh_error.as_deref() != Some(message.as_str()) {
+                    self.status_message = Some(format!("Cannot refresh tmux sessions: {message}"));
+                    self.last_tmux_refresh_error = Some(message);
+                }
                 false
             }
         }
@@ -5153,6 +5172,18 @@ mod tests {
             .unique_projects
             .iter()
             .any(|project| project == "project-b"));
+    }
+
+    #[test]
+    fn tmux_refresh_is_skipped_entirely_where_tmux_cannot_work() {
+        let mut app = App::new(Vec::new(), UserConfig::default());
+        app.tmux_support = TmuxSupport::Unavailable("not here".to_string());
+
+        assert!(!app.refresh_tmux_sessions());
+        assert!(
+            app.status_message.is_none(),
+            "an impossible feature must not produce periodic errors"
+        );
     }
 
     #[test]

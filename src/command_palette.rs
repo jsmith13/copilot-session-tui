@@ -179,7 +179,12 @@ fn commands(app: &App) -> Vec<CommandEntry> {
         .is_some_and(|session| app.is_favorite(&session.id));
     let project = app.command_project().is_some();
     let session_dir = app.new_session_dir().is_some();
-    let tmux_supported = crate::session::tmux::supported_platform();
+    let tmux_supported = app.tmux_support.is_available();
+    let tmux_unavailable_reason = if crate::session::tmux::supported_platform() {
+        "tmux is not installed or not working; check `tmux -V`"
+    } else {
+        "tmux requires a Unix-like operating system"
+    };
     let tmux_new_shortcut = app.config.tmux_keys.new_session.clone();
     let tmux_resume_shortcut = app.config.tmux_keys.resume_session.clone();
     let tmux_worktree_shortcut = app.config.tmux_keys.new_worktree.clone();
@@ -308,7 +313,7 @@ fn commands(app: &App) -> Vec<CommandEntry> {
             if tmux_supported {
                 "Available for a selected session in the list"
             } else {
-                "tmux requires a Unix-like operating system"
+                tmux_unavailable_reason
             },
         ),
         entry(
@@ -330,7 +335,7 @@ fn commands(app: &App) -> Vec<CommandEntry> {
             if tmux_supported {
                 "No session directory is available"
             } else {
-                "tmux requires a Unix-like operating system"
+                tmux_unavailable_reason
             },
         ),
         entry(
@@ -352,7 +357,7 @@ fn commands(app: &App) -> Vec<CommandEntry> {
             if tmux_supported {
                 "No Git project is available"
             } else {
-                "tmux requires a Unix-like operating system"
+                tmux_unavailable_reason
             },
         ),
         entry(

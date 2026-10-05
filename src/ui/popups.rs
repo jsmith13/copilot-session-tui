@@ -81,10 +81,16 @@ pub fn draw_quit_confirm(f: &mut Frame, app: &App) {
         )));
     }
     text.push(Line::from(""));
+    // Only talk about tmux when a tmux-backed pane is actually open; everyone else
+    // keeps the simple warning.
     text.push(Line::from(Span::styled(
-        format!(
-            "  {ending} CST-owned session(s) will end; {persistent} tmux session(s) will detach."
-        ),
+        if persistent > 0 {
+            format!(
+                "  {ending} CST-owned session(s) will end; {persistent} tmux session(s) will detach."
+            )
+        } else {
+            "  Sessions do not survive CST exiting.".to_string()
+        },
         Style::default().fg(theme.warning),
     )));
     text.push(Line::from(""));
@@ -382,7 +388,7 @@ pub fn draw_pane_list(f: &mut Frame, app: &App) {
 
     f.render_widget(List::new(items).style(surface_style(theme)), chunks[0]);
 
-    let hint = Line::from(vec![
+    let mut hint_spans = vec![
         Span::raw(" "),
         Span::styled("↑↓", Style::default().fg(theme.accent_alt)),
         Span::raw(" select  "),
@@ -390,14 +396,21 @@ pub fn draw_pane_list(f: &mut Frame, app: &App) {
         Span::raw(" attach  "),
         Span::styled("x", Style::default().fg(theme.accent_alt)),
         Span::raw(" close  "),
-        Span::styled(
-            app.config.tmux_keys.end_session.clone(),
-            Style::default().fg(theme.accent_alt),
-        ),
-        Span::raw(" end tmux  "),
+    ];
+    if app.tmux_support.is_available() {
+        hint_spans.extend([
+            Span::styled(
+                app.config.tmux_keys.end_session.clone(),
+                Style::default().fg(theme.accent_alt),
+            ),
+            Span::raw(" end tmux  "),
+        ]);
+    }
+    hint_spans.extend([
         Span::styled("Esc", Style::default().fg(theme.accent_alt)),
         Span::raw(" close"),
     ]);
+    let hint = Line::from(hint_spans);
     f.render_widget(Paragraph::new(hint).style(surface_style(theme)), chunks[1]);
 }
 
@@ -772,32 +785,41 @@ pub fn draw_help(f: &mut Frame, app: &mut App) {
         help_line(theme, "↑/k ↓/j", "Navigate sessions"),
         help_line(theme, "Home/End", "Jump to first/last"),
         help_line(theme, "Enter", "Resume selected session"),
-        help_line(
-            theme,
-            &app.config.tmux_keys.resume_session,
-            "Resume selected session persistently via tmux",
-        ),
         help_line(theme, "n", "New session (asks: as-is or isolated worktree)"),
-        help_line(
-            theme,
-            &app.config.tmux_keys.new_session,
-            "New persistent current-project session via tmux",
-        ),
         help_line(theme, "N", "New worktree session, skipping the question"),
-        help_line(
-            theme,
-            &app.config.tmux_keys.new_worktree,
-            "New persistent worktree session via tmux",
-        ),
-        help_line(
-            theme,
-            &app.config.tmux_keys.end_session,
-            "End the selected persistent tmux session",
-        ),
         help_line(theme, "r", "Rename selected session"),
         help_line(theme, "d", "Delete selected session"),
         help_line(theme, "e", "Open selected session scratchpad"),
-        help_line(theme, "◇ / ◆", "Persistent tmux session detached / open"),
+    ];
+    // Keys that cannot do anything here would only be noise in a help screen.
+    if app.tmux_support.is_available() {
+        text.extend([
+            Line::from(""),
+            help_section(theme, "Persistent tmux sessions"),
+            help_line(
+                theme,
+                &app.config.tmux_keys.resume_session,
+                "Resume selected session persistently via tmux",
+            ),
+            help_line(
+                theme,
+                &app.config.tmux_keys.new_session,
+                "New persistent current-project session via tmux",
+            ),
+            help_line(
+                theme,
+                &app.config.tmux_keys.new_worktree,
+                "New persistent worktree session via tmux",
+            ),
+            help_line(
+                theme,
+                &app.config.tmux_keys.end_session,
+                "End the selected persistent tmux session",
+            ),
+            help_line(theme, "◇ / ◆", "Persistent tmux session detached / open"),
+        ]);
+    }
+    text.extend([
         Line::from(""),
         help_section(theme, "Favorites"),
         help_line(theme, "Space", "Toggle selected session favorite"),
@@ -819,7 +841,7 @@ pub fn draw_help(f: &mut Frame, app: &mut App) {
         help_line(theme, "q/Esc", "Quit"),
         help_line(theme, "Ctrl+C", "Force quit"),
         Line::from(""),
-    ];
+    ]);
 
     if let Some(prefix) = app.prefix_label() {
         text.push(Line::from(Span::styled(
@@ -879,21 +901,34 @@ pub fn draw_help(f: &mut Frame, app: &mut App) {
             &format!("{prefix} 1-9"),
             "Jump to session by number",
         ));
-        text.push(help_line(
-            theme,
-            &format!("{prefix} {}", app.config.tmux_keys.end_session),
-            "End the persistent tmux session",
-        ));
-        text.push(help_line(
-            theme,
-            &format!("{prefix} x"),
-            "End a CST session or detach a tmux-backed tab",
-        ));
-        text.push(help_line(
-            theme,
-            &format!("{prefix} q"),
-            "Quit CST (persistent tmux sessions detach)",
-        ));
+        if app.tmux_support.is_available() {
+            text.push(help_line(
+                theme,
+                &format!("{prefix} {}", app.config.tmux_keys.end_session),
+                "End the persistent tmux session",
+            ));
+            text.push(help_line(
+                theme,
+                &format!("{prefix} x"),
+                "End a CST session or detach a tmux-backed tab",
+            ));
+            text.push(help_line(
+                theme,
+                &format!("{prefix} q"),
+                "Quit CST (persistent tmux sessions detach)",
+            ));
+        } else {
+            text.push(help_line(
+                theme,
+                &format!("{prefix} x"),
+                "End the focused session",
+            ));
+            text.push(help_line(
+                theme,
+                &format!("{prefix} q"),
+                "End the focused session and quit CST",
+            ));
+        }
         text.push(help_line(
             theme,
             &format!("{prefix} {prefix}"),
@@ -1260,16 +1295,18 @@ pub fn draw_settings(f: &mut Frame, app: &mut App) {
         "    Prefix key for pane commands, e.g. C-b, C-g, C-a",
         Style::default().fg(theme.muted),
     )));
-    lines.push(Line::from(Span::styled(
-        format!(
-            "    tmux keys: {} resume · {} new · {} worktree · {} end (config.json: tmux_keys)",
-            app.config.tmux_keys.resume_session,
-            app.config.tmux_keys.new_session,
-            app.config.tmux_keys.new_worktree,
-            app.config.tmux_keys.end_session
-        ),
-        Style::default().fg(theme.muted),
-    )));
+    if app.tmux_support.is_available() {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "    tmux keys: {} resume · {} new · {} worktree · {} end (config.json: tmux_keys)",
+                app.config.tmux_keys.resume_session,
+                app.config.tmux_keys.new_session,
+                app.config.tmux_keys.new_worktree,
+                app.config.tmux_keys.end_session
+            ),
+            Style::default().fg(theme.muted),
+        )));
+    }
 
     lines.push(Line::from(""));
     let shell_editing = app.settings_editing == Some(SettingsEditField::TerminalShell);

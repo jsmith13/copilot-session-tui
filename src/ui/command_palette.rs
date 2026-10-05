@@ -30,7 +30,13 @@ fn draw_prefix_menu(f: &mut Frame, app: &App) {
         .as_ref()
         .map(|mux| mux.prefix.label())
         .unwrap_or_else(|| "C-b".to_string());
-    let tmux_end = app.config.tmux_keys.end_session.as_str();
+    // An empty key renders as a blank row, which is how this sheet already pads
+    // columns — so hiding the tmux hint where tmux cannot work costs nothing.
+    let tmux_end = if app.tmux_support.is_available() {
+        app.config.tmux_keys.end_session.as_str()
+    } else {
+        ""
+    };
     let block = Block::default()
         .title(format!(" {prefix} · Commands "))
         .borders(Borders::ALL)

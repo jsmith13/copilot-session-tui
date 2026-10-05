@@ -148,11 +148,19 @@ pub fn launch(
 }
 
 pub fn find_live(session_id: &str) -> Result<Option<TmuxSessionRef>> {
+    // Resume must not depend on tmux bookkeeping where tmux cannot run: off Unix the
+    // registry, its directory and its lock file are never even touched.
+    if !supported_platform() {
+        return Ok(None);
+    }
     let path = registry_path();
     find_live_in(&path, session_id)
 }
 
 pub fn list_live() -> Result<Vec<TmuxSessionRef>> {
+    if !supported_platform() {
+        return Ok(Vec::new());
+    }
     let path = registry_path();
     list_live_in(&path)
 }
@@ -313,6 +321,62 @@ pub fn supported_platform() -> bool {
     cfg!(unix)
 }
 
+/// Whether persistent tmux sessions can work here, decided once per process.
+///
+/// Everything that offers a tmux action — key handlers, the command palette, help
+/// text — reads this answer instead of probing the system, so the whole UI agrees,
+/// tests can state either answer on any platform, and a missing tmux costs one probe
+/// per process instead of one per keypress. The platform cannot change while CST
+/// runs, and a tmux installed mid-session is picked up on the next start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TmuxSupport {
+    Available,
+    Unavailable(String),
+}
+
+impl TmuxSupport {
+    pub fn detect() -> Self {
+        static DETECTED: OnceLock<TmuxSupport> = OnceLock::new();
+        DETECTED.get_or_init(probe).clone()
+    }
+
+    pub fn is_available(&self) -> bool {
+        matches!(self, Self::Available)
+    }
+
+    pub fn unavailable_reason(&self) -> Option<&str> {
+        match self {
+            Self::Available => None,
+            Self::Unavailable(reason) => Some(reason),
+        }
+    }
+}
+
+fn probe() -> TmuxSupport {
+    if !supported_platform() {
+        return TmuxSupport::Unavailable(
+            "tmux-backed sessions require a Unix-like operating system".to_string(),
+        );
+    }
+    let output = match Command::new("tmux").arg("-V").output() {
+        Ok(output) => output,
+        Err(error) => {
+            return TmuxSupport::Unavailable(format!(
+                "tmux is not installed or not on PATH: {error}"
+            ));
+        }
+    };
+    if output.status.success() {
+        return TmuxSupport::Available;
+    }
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    TmuxSupport::Unavailable(if detail.is_empty() {
+        "tmux is installed but `tmux -V` failed".to_string()
+    } else {
+        format!("tmux is unavailable: {detail}")
+    })
+}
+
 fn register(reference: &TmuxSessionRef) -> Result<()> {
     let path = registry_path();
     let _lock = RegistryLock::acquire(&path)?;
@@ -345,26 +409,10 @@ fn is_live(reference: &TmuxSessionRef) -> Result<bool> {
 }
 
 pub fn check_available() -> Result<()> {
-    if !supported_platform() {
-        anyhow::bail!("tmux-backed sessions require a Unix-like operating system");
+    match TmuxSupport::detect() {
+        TmuxSupport::Available => Ok(()),
+        TmuxSupport::Unavailable(reason) => Err(anyhow::anyhow!(reason)),
     }
-    static AVAILABLE: OnceLock<()> = OnceLock::new();
-    if AVAILABLE.get().is_some() {
-        return Ok(());
-    }
-    let output = Command::new("tmux")
-        .arg("-V")
-        .output()
-        .map_err(|error| anyhow::anyhow!("tmux is not installed or not on PATH: {error}"))?;
-    if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if detail.is_empty() {
-            anyhow::bail!("tmux is installed but `tmux -V` failed");
-        }
-        anyhow::bail!("tmux is unavailable: {detail}");
-    }
-    let _ = AVAILABLE.set(());
-    Ok(())
 }
 
 fn tmux_command(reference: &TmuxSessionRef) -> Command {
@@ -626,6 +674,14 @@ mod tests {
             session_name_with_suffix("copy parser", "12345678-abcd-ef00", 12),
             "cst-copy-parser-12345678abcd"
         );
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn ownership_lookups_are_inert_off_unix_so_resume_never_touches_the_registry() {
+        assert!(find_live("any-session").unwrap().is_none());
+        assert!(list_live().unwrap().is_empty());
+        assert!(!TmuxSupport::detect().is_available());
     }
 
     #[test]

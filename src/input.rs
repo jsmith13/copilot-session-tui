@@ -484,7 +484,7 @@ fn handle_pane_list(app: &mut App, key: KeyCode) {
                 format!("Ended '{title}'")
             });
         }
-        key if app.config.tmux_keys.matches_end_session(key) => {
+        key if app.tmux_support.is_available() && app.config.tmux_keys.matches_end_session(key) => {
             let index = app.pane_selected.min(count - 1);
             let session_id = app
                 .mux
@@ -530,21 +530,25 @@ fn handle_normal(app: &mut App, key: KeyCode) {
         }
     }
 
-    if app.config.tmux_keys.matches_new_session(key) {
-        start_tmux_session(app);
-        return;
-    }
-    if app.config.tmux_keys.matches_resume_session(key) {
-        resume_selected_in_tmux(app);
-        return;
-    }
-    if app.config.tmux_keys.matches_new_worktree(key) {
-        begin_tmux_worktree_session(app);
-        return;
-    }
-    if app.config.tmux_keys.matches_end_session(key) {
-        request_end_selected_tmux_session(app);
-        return;
+    // Where tmux cannot work these keys stay exactly as inert as they are on a build
+    // without the feature, rather than answering every press with an error.
+    if app.tmux_support.is_available() {
+        if app.config.tmux_keys.matches_new_session(key) {
+            start_tmux_session(app);
+            return;
+        }
+        if app.config.tmux_keys.matches_resume_session(key) {
+            resume_selected_in_tmux(app);
+            return;
+        }
+        if app.config.tmux_keys.matches_new_worktree(key) {
+            begin_tmux_worktree_session(app);
+            return;
+        }
+        if app.config.tmux_keys.matches_end_session(key) {
+            request_end_selected_tmux_session(app);
+            return;
+        }
     }
 
     match key {
@@ -728,8 +732,8 @@ fn resume_selected(app: &mut App) {
 }
 
 fn resume_selected_in_tmux(app: &mut App) {
-    if let Err(error) = tmux::check_available() {
-        app.status_message = Some(format!("Cannot resume in tmux: {error}"));
+    if let Some(reason) = app.tmux_support.unavailable_reason() {
+        app.status_message = Some(format!("Cannot resume in tmux: {reason}"));
         return;
     }
     resume_selected_with_host(app, true);
@@ -953,8 +957,8 @@ fn handle_scratchpad(app: &mut App, event: Event) {
 }
 
 pub(crate) fn start_tmux_session(app: &mut App) {
-    if let Err(error) = tmux::check_available() {
-        app.status_message = Some(format!("Cannot start tmux session: {error}"));
+    if let Some(reason) = app.tmux_support.unavailable_reason() {
+        app.status_message = Some(format!("Cannot start tmux session: {reason}"));
         return;
     }
     let Some(cwd) = app.new_session_dir() else {
@@ -1043,8 +1047,8 @@ pub(crate) fn begin_worktree_session(app: &mut App) {
 }
 
 pub(crate) fn begin_tmux_worktree_session(app: &mut App) {
-    if let Err(error) = tmux::check_available() {
-        app.status_message = Some(format!("Cannot start tmux session: {error}"));
+    if let Some(reason) = app.tmux_support.unavailable_reason() {
+        app.status_message = Some(format!("Cannot start tmux session: {reason}"));
         return;
     }
     begin_worktree_session_for(app, WorktreeLaunchTarget::Tmux);
@@ -2272,12 +2276,48 @@ mod tests {
     #[test]
     fn terminal_shortcut_is_inert_on_session_list() {
         let mut app = App::new(Vec::new(), config::UserConfig::default());
+        // t doubles as the tmux resume key where tmux works; this test states the
+        // behaviour everywhere else, so pin the answer instead of probing the machine.
+        app.tmux_support =
+            crate::session::tmux::TmuxSupport::Unavailable("not in this test".to_string());
 
         handle_normal(&mut app, KeyCode::Char('t'));
 
         assert!(app.terminal.active_session_id().is_none());
         assert!(!app.terminal.is_visible());
         assert!(app.status_message.is_none());
+    }
+
+    #[test]
+    fn tmux_shortcuts_do_nothing_at_all_where_tmux_cannot_work() {
+        let session = crate::session::Session {
+            id: "plain-session".to_string(),
+            cwd: "/tmp/project".to_string(),
+            project_root: "/tmp/project".to_string(),
+            summary: Some("Plain".to_string()),
+            created_at: None,
+            updated_at: None,
+            is_active: false,
+            dir_path: PathBuf::from("/tmp/nonexistent-plain-session"),
+            edited_files: Vec::new(),
+            last_user_message: None,
+            turn_count: 0,
+            tool_call_count: 0,
+            details_parsed_len: 0,
+        };
+        let mut app = App::new(vec![session], config::UserConfig::default());
+        app.tmux_support =
+            crate::session::tmux::TmuxSupport::Unavailable("no tmux here".to_string());
+
+        // m, M and X are unbound on a build without the feature; answering with an
+        // error on every press would make Windows noisier than main, not safer.
+        for key in ['m', 'M', 'X'] {
+            handle_normal(&mut app, KeyCode::Char(key));
+            assert!(app.status_message.is_none(), "{key} must stay silent");
+            assert_eq!(app.mode, Mode::Normal, "{key} must not open a flow");
+        }
+        assert!(app.should_new_session.is_none());
+        assert!(app.confirm_end_tmux.is_none());
     }
 
     #[test]
@@ -2439,6 +2479,7 @@ mod tests {
         let mut config = config::UserConfig::default();
         config.tmux_keys.resume_session = "a".to_string();
         let mut app = App::new(vec![session], config);
+        app.tmux_support = crate::session::tmux::TmuxSupport::Available;
 
         handle_normal(&mut app, KeyCode::Char('a'));
 
@@ -2468,6 +2509,7 @@ mod tests {
         let mut config = config::UserConfig::default();
         config.worktree.root = temp.path().join("worktrees");
         let mut app = App::new(Vec::new(), config);
+        app.tmux_support = crate::session::tmux::TmuxSupport::Available;
         app.set_cwd_context(temp.path().to_string_lossy().to_string(), false);
 
         handle_normal(&mut app, KeyCode::Char('M'));
@@ -2494,6 +2536,7 @@ mod tests {
     #[test]
     fn lowercase_m_without_a_project_reports_what_is_missing() {
         let mut app = App::new(Vec::new(), config::UserConfig::default());
+        app.tmux_support = crate::session::tmux::TmuxSupport::Available;
 
         handle_normal(&mut app, KeyCode::Char('m'));
 
@@ -2523,6 +2566,7 @@ mod tests {
         let mut config = config::UserConfig::default();
         config.tmux_keys.end_session = "!".to_string();
         let mut app = App::new(vec![session], config);
+        app.tmux_support = crate::session::tmux::TmuxSupport::Available;
         app.replace_tmux_session(crate::session::tmux::TmuxSessionRef {
             session_id: "tmux-session".to_string(),
             tmux_session: "cst-persistent-tmux-sess".to_string(),

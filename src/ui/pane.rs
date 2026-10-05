@@ -1077,8 +1077,9 @@ mod tests {
             text.contains("Quit with 1 running session(s)?"),
             "prefix q must be answerable from the pane it was pressed in, got:\n{text}"
         );
+        // No tmux-backed pane is open, so the warning must not talk about tmux.
         assert!(
-            text.contains("1 CST-owned session(s) will end"),
+            text.contains("Sessions do not survive CST exiting."),
             "got:\n{text}"
         );
         let _ = app.mux.as_mut().expect("mux").shutdown();

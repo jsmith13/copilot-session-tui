@@ -864,7 +864,13 @@ fn handle_attached_key(app: &mut App, key: KeyEvent) {
     }
 
     if prefix_state == PrefixState::Root {
-        let command = resolve_prefix_command_with_tmux_keys(&key, &prefix, &app.config.tmux_keys);
+        let command = resolve_prefix_command_with_tmux_keys(
+            &key,
+            &prefix,
+            app.tmux_support
+                .is_available()
+                .then_some(&app.config.tmux_keys),
+        );
         if let Some(mux) = app.mux.as_mut() {
             mux.prefix_state = PrefixState::Idle;
         }
@@ -1960,7 +1966,13 @@ pub fn handle_list_prefix(app: &mut App, key: KeyEvent) -> bool {
     if let Some(mux) = app.mux.as_mut() {
         mux.prefix_state = PrefixState::Idle;
     }
-    let command = resolve_prefix_command_with_tmux_keys(&key, &prefix, &app.config.tmux_keys);
+    let command = resolve_prefix_command_with_tmux_keys(
+        &key,
+        &prefix,
+        app.tmux_support
+            .is_available()
+            .then_some(&app.config.tmux_keys),
+    );
     if matches!(command, Some(PrefixCommand::Help)) {
         if let Some(mux) = app.mux.as_mut() {
             mux.prefix_state = PrefixState::Help;
@@ -3827,9 +3839,39 @@ mod tests {
     }
 
     #[test]
+    fn tmux_palette_commands_grey_out_with_a_reason_where_tmux_cannot_work() {
+        let mut app = attached_mux_app("tmux-greyed");
+        app.tmux_support =
+            crate::session::tmux::TmuxSupport::Unavailable("no tmux here".to_string());
+
+        let commands = crate::command_palette::filtered_commands(&app);
+
+        for id in [
+            CommandId::NewTmuxSession,
+            CommandId::NewTmuxWorktreeSession,
+            CommandId::ResumeSelectedInTmux,
+            CommandId::EndPersistentSession,
+        ] {
+            let command = commands
+                .iter()
+                .find(|command| command.id == id)
+                .unwrap_or_else(|| panic!("{id:?} should stay listed so it is discoverable"));
+            assert!(!command.enabled, "{id:?} must be greyed out");
+        }
+        // The greyed entries explain themselves instead of silently failing.
+        assert!(commands
+            .iter()
+            .filter(|command| command.id == CommandId::NewTmuxSession)
+            .all(|command| command
+                .unavailable_reason
+                .is_some_and(|r| r.contains("tmux"))));
+    }
+
+    #[test]
     fn portable_commands_are_enabled_while_attached() {
         let mut app = attached_mux_app("portable-commands");
         app.config.hidden_title_prefixes = vec!["Your objective:".to_string()];
+        app.tmux_support = crate::session::tmux::TmuxSupport::Available;
         let commands = crate::command_palette::filtered_commands(&app);
 
         for id in [
