@@ -211,9 +211,9 @@ This creates a `cst` function. Use `cst` instead of `copilot-session-tui` and yo
 | `g` | Grab the selected favorite, then `↑`/`↓` to move it |
 | `T` | Open inactive favorites as panes or Windows Terminal tabs |
 | `e` | Open selected session scratchpad |
-| `n` | New session in the filtered project (or the current directory's project) |
+| `n` | New session in the filtered project (or the current directory's project) — asks whether to run it as-is or in an isolated worktree |
 | `m` | New persistent tmux-backed session in the current project |
-| `N` | New isolated worktree session with an editable branch name |
+| `N` | New isolated worktree session directly, skipping the question |
 | `M` | New persistent tmux-backed session in an isolated worktree |
 | `X` | End the selected persistent tmux session |
 | `r` | Rename session |

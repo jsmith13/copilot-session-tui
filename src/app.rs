@@ -82,6 +82,8 @@ pub enum Mode {
     ConfirmTakeover,
     /// Asks how the inactive favorites should be opened.
     FavoriteOpen,
+    /// Asks whether a new session should run in the project as-is or in a worktree.
+    NewSessionKind,
     FilterProject,
     Help,
     Settings,
@@ -3123,6 +3125,15 @@ impl App {
 
     pub fn is_favorite(&self, session_id: &str) -> bool {
         self.favorite_rank(session_id).is_some()
+    }
+
+    /// True when `g` would actually start a reorder, so the footer only advertises
+    /// the key while it works.
+    pub fn selected_favorite_reorderable(&self) -> bool {
+        self.favorites_section_active()
+            && self
+                .selected_session()
+                .is_some_and(|session| self.favorite_rank(&session.id).is_some())
     }
 
     /// Position of a session within the user's favorite order, if it is one.

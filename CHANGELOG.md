@@ -3,6 +3,12 @@
 What changed in CST, newest first. Written for people using it, not for the code.
 Earlier releases: https://github.com/tupini07/copilot-session-tui/releases
 
+## v0.33.1 - 2026-10-02
+
+- Ctrl+click a link in a session to open it, including links that show text instead of an address.
+- Web links open on your own computer, even when CST runs on another machine over SSH.
+- Clicking a link to a file shows it in its folder instead of running it.
+
 ## v0.33.0 - 2026-09-24
 
 - Note: a turn that finishes while you are watching its pane no longer sends a notification.

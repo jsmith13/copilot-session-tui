@@ -195,6 +195,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         if app.mode == Mode::FavoriteOpen {
             popups::draw_favorite_open(f, app);
         }
+        if app.mode == Mode::NewSessionKind {
+            popups::draw_new_session_kind(f, app);
+        }
         // `prefix q` can raise this without leaving the pane, so it has to be drawn
         // here too — the list view below is never reached while attached.
         command_palette::draw_overlays(f, app);
@@ -291,6 +294,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Mode::ConfirmForceDelete => popups::draw_force_delete_confirm(f, app),
         Mode::ConfirmTakeover => popups::draw_takeover_confirm(f, app),
         Mode::FavoriteOpen => popups::draw_favorite_open(f, app),
+        Mode::NewSessionKind => popups::draw_new_session_kind(f, app),
         Mode::FilterProject => popups::draw_project_filter(f, app),
         Mode::Rename => popups::draw_rename(f, app),
         _ => {}
