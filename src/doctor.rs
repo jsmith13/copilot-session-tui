@@ -134,9 +134,39 @@ pub fn gather(copilot_home: &Path) -> Report {
             gh_installed_check(&auth),
             gh_auth_check(&auth),
             git_check(crate::session::worktree::git_version()),
+            tmux_check(crate::session::tmux::TmuxSupport::detect()),
             hooks_check(hooks),
             config_check(&config_path, config.as_ref().map(Option::is_some)),
         ],
+    }
+}
+
+fn tmux_check(support: crate::session::tmux::TmuxSupport) -> Check {
+    const NAME: &str = "tmux";
+    const FEATURE: &str = "persistent sessions that survive CST exiting";
+    match support {
+        crate::session::tmux::TmuxSupport::Available => {
+            Check::ok(NAME, Importance::Optional, "installed.".to_string())
+        }
+        crate::session::tmux::TmuxSupport::Unavailable(reason)
+            if !crate::session::tmux::supported_platform() =>
+        {
+            // Not installable here, so no remedy to suggest; the report should not
+            // read like something is wrong with the machine.
+            Check::ok(
+                NAME,
+                Importance::Optional,
+                format!("not applicable: {reason}."),
+            )
+        }
+        crate::session::tmux::TmuxSupport::Unavailable(reason) => Check::unhealthy(
+            NAME,
+            Importance::Optional,
+            Health::Missing,
+            format!("{reason}."),
+            Some(FEATURE),
+            "Install tmux if you want sessions that keep running outside CST.".to_string(),
+        ),
     }
 }
 
