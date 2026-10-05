@@ -41,17 +41,10 @@ pub(crate) fn handle_end_tmux_confirm(app: &mut App, key: KeyCode) {
         .mux
         .as_ref()
         .and_then(|mux| mux.pane_for_session(&reference.session_id));
-    if let Some(pane_id) = pane_id {
-        if !app.forget_workspace_panels(pane_id) {
-            app.confirm_end_tmux = None;
-            return;
-        }
-    }
+    // Kill first: tearing the workspace panels down before a kill that then fails
+    // would discard them for a session that is still running.
     match tmux::kill(&reference) {
         Ok(()) => {
-            if let (Some(mux), Some(pane_id)) = (app.mux.as_mut(), pane_id) {
-                mux.remove(pane_id);
-            }
             app.forget_tmux_session(&reference.session_id);
             if let Some(session) = app
                 .sessions
@@ -60,10 +53,21 @@ pub(crate) fn handle_end_tmux_confirm(app: &mut App, key: KeyCode) {
             {
                 session.is_active = false;
             }
-            app.status_message = Some(format!(
-                "Ended persistent tmux session '{}'",
-                reference.tmux_session
-            ));
+            let panels_cleared = match pane_id {
+                Some(pane_id) => app.forget_workspace_panels(pane_id),
+                None => true,
+            };
+            if panels_cleared {
+                if let (Some(mux), Some(pane_id)) = (app.mux.as_mut(), pane_id) {
+                    mux.remove(pane_id);
+                }
+                app.status_message = Some(format!(
+                    "Ended persistent tmux session '{}'",
+                    reference.tmux_session
+                ));
+            }
+            // On a failed scratchpad save the pane stays, showing the exited session,
+            // and the save error already on the status line explains why.
             crate::mux_input::sync_workspace_panels(app);
             crate::mux_input::sync_view(app);
         }
