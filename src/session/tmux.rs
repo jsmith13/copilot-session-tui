@@ -534,15 +534,7 @@ fn append_socket_args(args: &mut Vec<String>, reference: &TmuxSessionRef) {
 }
 
 fn dedicated_server_socket() -> PathBuf {
-    dirs::data_local_dir()
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".local")
-                .join("share")
-        })
-        .join("cst")
-        .join("tmux.sock")
+    crate::app_state::state_root().join("tmux.sock")
 }
 
 fn session_name(title: &str, session_id: &str) -> String {
@@ -578,16 +570,10 @@ fn session_name_with_suffix(title: &str, session_id: &str, suffix_len: usize) ->
     format!("cst-{slug}-{short_id}")
 }
 
+// Internal bookkeeping lives under the same root as app state and scratchpads, not
+// the user-navigated `cst/` root that holds worktrees.
 fn registry_path() -> PathBuf {
-    dirs::data_local_dir()
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".local")
-                .join("share")
-        })
-        .join("cst")
-        .join("tmux-sessions.json")
+    crate::app_state::state_root().join("tmux-sessions.json")
 }
 
 /// A registry that cannot be read must never block resuming sessions: the worst
