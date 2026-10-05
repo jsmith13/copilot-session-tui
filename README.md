@@ -861,6 +861,10 @@ reported and is never silently overwritten.
 
 ### Persistent tmux-backed sessions
 
+Persistent sessions need a working `tmux` on PATH, so they are available on Linux and
+macOS only. On Windows the shortcuts stay inert and the related commands appear greyed
+out in Command Search; everything else in CST works as before.
+
 Press `t` to resume the selected conversation with tmux owning its Copilot process.
 Press `m` to start a new Copilot conversation for the current project with tmux owning
 the Copilot process. Press `M` to create the same managed Git worktree as `N` and start
