@@ -144,6 +144,22 @@ pub struct PendingWorktree {
     pub target: WorktreeLaunchTarget,
 }
 
+/// A tmux launch deferred to the main loop for the same reason as [`PendingWorktree`]:
+/// starting a tmux server and waiting out the startup grace takes long enough that the
+/// key handler must not block on it before anything is painted.
+#[derive(Debug, Clone)]
+pub enum PendingTmuxLaunch {
+    New {
+        cwd: String,
+        title: String,
+    },
+    Resume {
+        session_id: String,
+        cwd: String,
+        title: String,
+    },
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UpdateRestartRequest {
     pub panes: Vec<UpdateRestartPane>,
@@ -752,6 +768,7 @@ pub struct App {
     pub exit_dir: Option<String>,
     /// A worktree the main loop should create on its next iteration.
     pub pending_worktree: Option<PendingWorktree>,
+    pub pending_tmux_launch: Option<PendingTmuxLaunch>,
     pub scratchpad: Option<Scratchpad>,
     pub scratchpad_owner: Option<crate::mux::PaneId>,
     pub scratchpad_open: HashSet<crate::mux::PaneId>,
@@ -910,6 +927,7 @@ impl App {
             mux_on_disk,
             exit_dir: None,
             pending_worktree: None,
+            pending_tmux_launch: None,
             scratchpad: None,
             scratchpad_owner: None,
             scratchpad_open: HashSet::new(),
@@ -4193,6 +4211,7 @@ impl App {
             || self.command_palette.is_some()
             || self.confirm_end_tmux.is_some()
             || self.pending_worktree.is_some()
+            || self.pending_tmux_launch.is_some()
             || self.github_inspector.as_ref().is_some_and(|inspector| {
                 matches!(
                     &inspector.screen,

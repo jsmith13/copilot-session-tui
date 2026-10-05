@@ -1,8 +1,8 @@
 #[cfg(test)]
 use crate::app::SettingsSection;
 use crate::app::{
-    App, DeleteTarget, Mode, NewSessionRequest, PendingWorktree, SettingsEditField, TakeoverTarget,
-    View, WorktreeLaunchTarget,
+    App, DeleteTarget, Mode, NewSessionRequest, PendingTmuxLaunch, PendingWorktree,
+    SettingsEditField, TakeoverTarget, View, WorktreeLaunchTarget,
 };
 use crate::config;
 use crate::session::loader;
@@ -832,12 +832,13 @@ fn resume_target(app: &mut App, id: String, cwd: String, title: String) {
 
 fn resume_target_in_tmux(app: &mut App, id: String, cwd: String, title: String) {
     if app.mux_enabled() {
-        app.status_message = Some(
-            match manager::resume_tmux_session(&id, Path::new(&cwd), &title, &app.config) {
-                Ok(launched) => complete_tmux_launch(app, launched, title, "Resumed session"),
-                Err(error) => format!("Cannot resume in tmux: {error}"),
-            },
-        );
+        // Handed to the main loop so the notice is painted before the launch blocks.
+        app.status_message = Some(format!("Resuming '{title}' in a tmux session…"));
+        app.pending_tmux_launch = Some(PendingTmuxLaunch::Resume {
+            session_id: id,
+            cwd,
+            title,
+        });
     } else {
         app.should_new_session = Some(NewSessionRequest::TmuxResume {
             session_id: id,
@@ -985,12 +986,33 @@ pub(crate) fn start_tmux_session(app: &mut App) {
         app.should_new_session = Some(NewSessionRequest::Tmux { cwd, title });
         return;
     }
-    app.status_message = Some(
-        match manager::start_tmux_session(Path::new(&cwd), &title, &app.config) {
-            Ok(launched) => complete_tmux_launch(app, launched, title, "Started new session"),
-            Err(error) => format!("Cannot start tmux session: {error}"),
-        },
-    );
+    // Starting a tmux server, Copilot and the startup grace takes ~half a second, so
+    // hand it to the main loop; the notice is painted before anything blocks.
+    app.status_message = Some(format!("Starting tmux session for '{title}'…"));
+    app.pending_tmux_launch = Some(PendingTmuxLaunch::New { cwd, title });
+}
+
+/// Run a deferred tmux launch from the main loop, after its notice was painted.
+pub fn run_pending_tmux_launch(app: &mut App, pending: PendingTmuxLaunch) {
+    let message = match pending {
+        PendingTmuxLaunch::New { cwd, title } => {
+            match manager::start_tmux_session(Path::new(&cwd), &title, &app.config) {
+                Ok(launched) => complete_tmux_launch(app, launched, title, "Started new session"),
+                Err(error) => format!("Cannot start tmux session: {error}"),
+            }
+        }
+        PendingTmuxLaunch::Resume {
+            session_id,
+            cwd,
+            title,
+        } => {
+            match manager::resume_tmux_session(&session_id, Path::new(&cwd), &title, &app.config) {
+                Ok(launched) => complete_tmux_launch(app, launched, title, "Resumed session"),
+                Err(error) => format!("Cannot resume in tmux: {error}"),
+            }
+        }
+    };
+    app.status_message = Some(message);
 }
 
 fn complete_tmux_launch(
@@ -2300,6 +2322,37 @@ mod tests {
         assert!(app.terminal.active_session_id().is_none());
         assert!(!app.terminal.is_visible());
         assert!(app.status_message.is_none());
+    }
+
+    #[test]
+    fn starting_a_tmux_session_in_mux_mode_defers_the_launch_behind_a_notice() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join(".git")).unwrap();
+        let config = config::UserConfig {
+            mux: true,
+            ..config::UserConfig::default()
+        };
+        let mut app = App::new(Vec::new(), config);
+        app.disable_workspace_state_persistence();
+        app.disable_config_persistence();
+        app.tmux_support = crate::session::tmux::TmuxSupport::Available;
+        app.set_cwd_context(temp.path().to_string_lossy().to_string(), false);
+
+        handle_normal(&mut app, KeyCode::Char('m'));
+
+        // The key handler must not block on the tmux server start; the main loop
+        // runs the launch after this notice has been painted.
+        assert!(
+            matches!(app.pending_tmux_launch, Some(PendingTmuxLaunch::New { .. })),
+            "expected a deferred launch, got {:?} / status {:?}",
+            app.pending_tmux_launch,
+            app.status_message
+        );
+        assert!(app
+            .status_message
+            .as_deref()
+            .is_some_and(|message| message.contains("tmux")));
+        let _ = app.mux.as_mut().expect("mux").shutdown();
     }
 
     #[test]

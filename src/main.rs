@@ -1255,6 +1255,13 @@ fn run_app(
             continue;
         }
 
+        // Same contract: the tmux server start and its startup grace block for long
+        // enough that the launch notice must be painted first.
+        if let Some(pending) = app.pending_tmux_launch.take() {
+            input::run_pending_tmux_launch(app, pending);
+            continue;
+        }
+
         if app.mux.is_some() {
             repaint = pump_mux(app)?;
         } else {
