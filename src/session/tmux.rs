@@ -414,13 +414,11 @@ fn start_program(
         .arg(format!("{}:0.0", reference.tmux_session))
         .arg("-c")
         .arg(cwd)
-        // Copilot changes clipboard backends when TMUX is present. It is still owned by
-        // tmux, but hiding the variable keeps the direct OSC 52 path that CST forwards.
-        .arg("env")
-        .args(["-u", "TMUX"])
-        // Multiple shell-command arguments are executed directly by tmux.
-        .arg(program)
-        .args(args)
+        // One pre-quoted string, not one argument per word: tmux only execs multiple
+        // shell-command arguments directly since 3.5. Older servers (Debian 12 has
+        // 3.3a, Ubuntu 24.04 has 3.4) join them with spaces and hand the result to a
+        // shell, which would word-split a Copilot path containing a space.
+        .arg(launch_command(program, args))
         .output()
         .with_context(|| {
             format!(
@@ -436,6 +434,32 @@ fn start_program(
         ));
     }
     Ok(())
+}
+
+/// The single shell command tmux runs in the pane, safe for any POSIX shell.
+///
+/// Copilot changes clipboard backends when TMUX is present. It is still owned by
+/// tmux, but hiding the variable keeps the direct OSC 52 path that CST forwards.
+fn launch_command(program: &str, args: &[String]) -> String {
+    let mut command = String::from("exec env -u TMUX");
+    for word in std::iter::once(program).chain(args.iter().map(String::as_str)) {
+        command.push(' ');
+        command.push_str(&shell_quote(word));
+    }
+    command
+}
+
+/// POSIX single-quoting: everything is literal inside '…' except ' itself, which is
+/// spliced as '\''. Plain words pass through so the command stays readable in tmux.
+fn shell_quote(word: &str) -> String {
+    let plain = !word.is_empty()
+        && word
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "_@%+=:,./-".contains(character));
+    if plain {
+        return word.to_string();
+    }
+    format!("'{}'", word.replace('\'', r"'\''"))
 }
 
 fn kill_unregistered(reference: &TmuxSessionRef) -> Result<()> {
@@ -601,6 +625,23 @@ mod tests {
         assert_eq!(
             session_name_with_suffix("copy parser", "12345678-abcd-ef00", 12),
             "cst-copy-parser-12345678abcd"
+        );
+    }
+
+    #[test]
+    fn launch_command_survives_spaces_and_quotes_on_tmux_older_than_3_5() {
+        // tmux <= 3.4 joins multiple shell-command arguments with spaces and runs the
+        // result through a shell, so the one string we pass must quote its own words.
+        assert_eq!(
+            launch_command(
+                "/home/user name/.local/bin/copilot",
+                &["--resume".to_string(), "it's-a-session".to_string()],
+            ),
+            r#"exec env -u TMUX '/home/user name/.local/bin/copilot' --resume 'it'\''s-a-session'"#
+        );
+        assert_eq!(
+            launch_command("copilot", &["--banner".to_string()]),
+            "exec env -u TMUX copilot --banner"
         );
     }
 
