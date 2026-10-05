@@ -697,24 +697,29 @@ pub fn draw_help(f: &mut Frame, app: &mut App) {
             Style::default().fg(theme.muted),
         )),
         Line::from(""),
+        help_section(theme, "Sessions"),
         help_line(theme, "↑/k ↓/j", "Navigate sessions"),
         help_line(theme, "Home/End", "Jump to first/last"),
         help_line(theme, "Enter", "Resume selected session"),
-        help_line(theme, "n", "New session in current project"),
-        help_line(theme, "N", "New isolated worktree session"),
+        help_line(theme, "n", "New session (asks: as-is or isolated worktree)"),
+        help_line(theme, "N", "New worktree session, skipping the question"),
+        help_line(theme, "r", "Rename selected session"),
+        help_line(theme, "d", "Delete selected session"),
+        help_line(theme, "e", "Open selected session scratchpad"),
+        Line::from(""),
+        help_section(theme, "Favorites"),
         help_line(theme, "Space", "Toggle selected session favorite"),
         help_line(theme, "g", "Grab a favorite, then ↑/↓ to reorder"),
         help_line(theme, "T", "Open favorites as panes or terminal tabs"),
-        help_line(theme, "e", "Open selected session scratchpad"),
-        help_line(theme, "r", "Rename selected session"),
-        help_line(theme, "d", "Delete selected session"),
         Line::from(""),
+        help_section(theme, "Filter & sort"),
         help_line(theme, "/", "Search / fuzzy filter"),
         help_line(theme, "f/p", "Filter by project (type to search)"),
         help_line(theme, "c", "Clear project filter"),
         help_line(theme, "s", "Cycle sort order"),
         help_line(theme, "H", "Temporarily show/hide filtered sessions"),
         Line::from(""),
+        help_section(theme, "Settings & app"),
         help_line(theme, ",", "Global settings"),
         help_line(theme, ".", "Filtered-project settings"),
         help_line(theme, "?", "Toggle this help"),
@@ -868,6 +873,16 @@ fn reference_legend(theme: Theme) -> Vec<Line<'static>> {
     states.extend(sample(theme.accent_alt, theme.muted, "draft"));
 
     vec![Line::from(kinds), Line::from(states)]
+}
+
+/// Group header matching the style of the multiplexer section below.
+fn help_section(theme: Theme, title: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("  {title}"),
+        Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD),
+    ))
 }
 
 fn help_line(theme: Theme, key: &str, desc: &str) -> Line<'static> {
@@ -2049,6 +2064,63 @@ pub fn draw_favorite_open(f: &mut Frame, app: &App) {
         ),
         Span::raw(" cancel"),
     ]));
+
+    f.render_widget(
+        Paragraph::new(lines)
+            .style(surface_style(theme))
+            .wrap(Wrap { trim: false }),
+        inner,
+    );
+}
+
+/// Asks whether a new session should run in the project as-is or in a worktree.
+pub fn draw_new_session_kind(f: &mut Frame, app: &App) {
+    let theme = app.theme();
+    let area = centered_rect(58, 38, f.area());
+    prepare_popup(f, area, theme);
+    let block = Block::default()
+        .title(" New Session ")
+        .borders(Borders::ALL)
+        .style(surface_style(theme))
+        .border_style(Style::default().fg(theme.accent));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let directory = app.new_session_dir().unwrap_or_default();
+    let choice = |key: &'static str, label: &'static str| {
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                key,
+                Style::default()
+                    .fg(theme.accent_alt)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!("  {label}")),
+        ])
+    };
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  Start a Copilot session in {directory}"),
+            Style::default().fg(theme.text),
+        )),
+        Line::from(""),
+        choice("n", "here, in the project as-is (Enter too)"),
+        choice("w", "in a new isolated Git worktree"),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "Esc",
+                Style::default()
+                    .fg(theme.muted)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" cancel"),
+        ]),
+    ];
 
     f.render_widget(
         Paragraph::new(lines)

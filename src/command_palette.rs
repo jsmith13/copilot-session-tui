@@ -280,7 +280,7 @@ fn commands(app: &App) -> Vec<CommandEntry> {
             Id::NewSession,
             Group::Sessions,
             "New session",
-            "Start Copilot in the current directory or active project",
+            "Start Copilot in the active project, asking as-is or worktree",
             "n",
             session_dir,
             "No session directory is available",

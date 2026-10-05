@@ -128,6 +128,7 @@ pub fn handle_terminal_event(app: &mut App, event: Event) -> anyhow::Result<()> 
         Mode::ConfirmForceDelete => handle_confirm_force_delete(app, key.code),
         Mode::ConfirmTakeover => handle_confirm_takeover(app, key.code),
         Mode::FavoriteOpen => handle_favorite_open(app, key.code),
+        Mode::NewSessionKind => handle_new_session_kind(app, key.code),
         Mode::FilterProject => handle_filter_project(app, key.code),
         Mode::Help => handle_help(app, key.code),
         Mode::Settings => handle_settings(app, key.code),
@@ -511,24 +512,7 @@ fn handle_normal(app: &mut App, key: KeyCode) {
             app.set_project_filter(None);
             app.status_message = Some("Filter cleared".to_string());
         }
-        KeyCode::Char('n') => {
-            if let Some(cwd) = app.new_session_dir() {
-                if app.mux_enabled() {
-                    let title = project_title(&cwd);
-                    match app.attach_new_session(&cwd, title) {
-                        Ok(()) => crate::mux_input::sync_workspace_panels(app),
-                        Err(error) => {
-                            app.status_message = Some(format!("Cannot start session: {error}"))
-                        }
-                    }
-                } else {
-                    app.should_new_session = Some(NewSessionRequest::Normal { cwd });
-                }
-            } else {
-                app.status_message =
-                    Some("Filter by a project first (f) to start a new session".to_string());
-            }
-        }
+        KeyCode::Char('n') => begin_new_session_choice(app),
         KeyCode::Char('N') => begin_worktree_session(app),
         KeyCode::Char('?') => {
             app.help_scroll = 0;
@@ -771,6 +755,55 @@ fn handle_scratchpad(app: &mut App, event: Event) {
         Err(error) => {
             scratchpad.status_message = Some(format!("Scratchpad save failed: {error}"));
         }
+    }
+}
+
+/// Ask whether the new session should live in the project as-is or in a worktree.
+///
+/// `N` used to carry the worktree variant on its own, but a second, shift-modified key
+/// for a close sibling of `n` was easy to miss in the footer and easy to forget. One
+/// key that asks is cheaper to discover than two keys to memorise; `N` still works as
+/// an undocumented-in-the-footer shortcut that skips the question.
+fn begin_new_session_choice(app: &mut App) {
+    if app.new_session_dir().is_none() {
+        app.status_message =
+            Some("Filter by a project first (f) to start a new session".to_string());
+        return;
+    }
+    app.mode = Mode::NewSessionKind;
+}
+
+pub(crate) fn handle_new_session_kind(app: &mut App, key: KeyCode) {
+    match key {
+        KeyCode::Char('n') | KeyCode::Enter => {
+            app.mode = Mode::Normal;
+            start_plain_new_session(app);
+        }
+        KeyCode::Char('w') | KeyCode::Char('W') => {
+            app.mode = Mode::Normal;
+            begin_worktree_session(app);
+        }
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.mode = Mode::Normal;
+        }
+        _ => {}
+    }
+}
+
+fn start_plain_new_session(app: &mut App) {
+    let Some(cwd) = app.new_session_dir() else {
+        app.status_message =
+            Some("Filter by a project first (f) to start a new session".to_string());
+        return;
+    };
+    if app.mux_enabled() {
+        let title = project_title(&cwd);
+        match app.attach_new_session(&cwd, title) {
+            Ok(()) => crate::mux_input::sync_workspace_panels(app),
+            Err(error) => app.status_message = Some(format!("Cannot start session: {error}")),
+        }
+    } else {
+        app.should_new_session = Some(NewSessionRequest::Normal { cwd });
     }
 }
 
@@ -2064,6 +2097,7 @@ mod tests {
         assert!(app.project_filter.is_none());
 
         handle_normal(&mut app, KeyCode::Char('n'));
+        handle_new_session_kind(&mut app, KeyCode::Char('n'));
 
         match app.should_new_session {
             Some(NewSessionRequest::Normal { ref cwd }) => {
@@ -2071,6 +2105,63 @@ mod tests {
             }
             other => panic!("expected a normal new session request, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn new_session_shortcut_asks_for_the_kind_before_starting_anything() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join(".git")).unwrap();
+        let mut app = App::new(Vec::new(), config::UserConfig::default());
+        app.set_cwd_context(temp.path().to_string_lossy().to_string(), false);
+
+        handle_normal(&mut app, KeyCode::Char('n'));
+
+        assert_eq!(app.mode, Mode::NewSessionKind);
+        assert!(
+            app.should_new_session.is_none(),
+            "nothing may start until a kind is chosen"
+        );
+    }
+
+    #[test]
+    fn cancelling_the_new_session_question_starts_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join(".git")).unwrap();
+        let mut app = App::new(Vec::new(), config::UserConfig::default());
+        app.set_cwd_context(temp.path().to_string_lossy().to_string(), false);
+
+        handle_normal(&mut app, KeyCode::Char('n'));
+        handle_new_session_kind(&mut app, KeyCode::Esc);
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.should_new_session.is_none());
+        assert!(app.pending_worktree.is_none());
+    }
+
+    #[test]
+    fn choosing_worktree_in_the_new_session_question_reaches_the_worktree_flow() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join(".git")).unwrap();
+        let mut app = App::new(Vec::new(), config::UserConfig::default());
+        app.set_cwd_context(temp.path().to_string_lossy().to_string(), false);
+
+        handle_normal(&mut app, KeyCode::Char('n'));
+        handle_new_session_kind(&mut app, KeyCode::Char('w'));
+
+        // A bare `.git` directory is not a usable repository, so reaching the
+        // worktree flow shows either its branch prompt or its error — never the
+        // plain-session path.
+        let reached_worktree_flow = app.mode == Mode::BranchName
+            || app
+                .status_message
+                .as_deref()
+                .is_some_and(|message| message.contains("worktree"));
+        assert!(
+            reached_worktree_flow,
+            "mode: {:?}, status: {:?}",
+            app.mode, app.status_message
+        );
+        assert!(app.should_new_session.is_none());
     }
 
     #[test]

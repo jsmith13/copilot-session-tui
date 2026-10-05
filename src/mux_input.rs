@@ -107,6 +107,16 @@ pub fn handle_attached_event(app: &mut App, event: Event) {
         return;
     }
 
+    // Same situation: the palette's "New session" lands here while attached.
+    if app.mode == Mode::NewSessionKind {
+        if let Event::Key(key) = &event {
+            if key.kind == KeyEventKind::Press {
+                crate::input::handle_new_session_kind(app, key.code);
+            }
+        }
+        return;
+    }
+
     if app.snippet_modal.is_some() {
         handle_snippet_event(app, event);
         return;
