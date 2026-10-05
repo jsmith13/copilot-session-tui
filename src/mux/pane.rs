@@ -229,6 +229,17 @@ impl Pane {
         if !executable.is_empty() {
             environment.push((crate::threads::CLI_PATH_ENV, executable.as_str()));
         }
+        // On Windows, portable-pty rebuilds the child's PATH from the registry rather
+        // than inheriting this process's. That splits the toolchain in two: `copilot`
+        // is probed against the PATH CST was launched with, but a pane would resolve
+        // the same bare name against the registry's idea of PATH, so the binary that
+        // answered the probe and the binary that runs could differ. Passing our PATH
+        // down keeps them the same program, and keeps anything the user put on their
+        // shell's PATH visible to the session.
+        let inherited_path = std::env::var("PATH").unwrap_or_default();
+        if !inherited_path.is_empty() {
+            environment.push(("PATH", inherited_path.as_str()));
+        }
         let pty = PtySession::spawn(&program, &args, Some(&cwd), size, &environment, chunk_tx)?;
 
         // Device-status replies must reach the child, or ConPTY stalls on startup.

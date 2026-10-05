@@ -5496,6 +5496,182 @@ mod tests {
         let _ = app.mux.as_mut().unwrap().shutdown();
     }
 
+    /// The whole journey from the bug report, against the real binary: Copilot crashes,
+    /// the dead pane offers `r`, and pressing it brings the same session back in place.
+    /// Everything between the keystroke and the resumed child is real — the PTY, the
+    /// key routing, `attach_session`, the PATH lookup, the spawn.
+    ///
+    /// Hermetic despite being live: `--copilot-home` points into a sandbox and a
+    /// compiled stand-in `copilot` sits first on PATH, so nothing reads the real
+    /// session list and no AI credit is spent. The stand-in crashes its first launch
+    /// with code 134 — the OOM exit this feature was built for — and stays alive when
+    /// resumed. PATH is changed process-wide, which is safe here because every other
+    /// ignored test gates itself off unless its own env var is set.
+    ///
+    /// One known leak: the What's new marker lives in the real local data dir, not
+    /// under the Copilot home, so a run on a machine whose marker is older than this
+    /// build advances it. The screen stays reachable from the command palette.
+    #[test]
+    #[ignore = "drives the real cst binary in a PTY; run with CST_RESTART_E2E=1"]
+    fn a_crashed_session_really_restarts_in_place_when_r_is_pressed() {
+        use std::sync::mpsc::{self, Receiver};
+        use std::time::{Duration, Instant};
+
+        if std::env::var_os("CST_RESTART_E2E").is_none() {
+            return;
+        }
+
+        // target/debug/deps/<test>-<hash>.exe -> target/debug/<bin>.
+        let mut dir = std::env::current_exe().expect("test executable path");
+        dir.pop();
+        if dir.ends_with("deps") {
+            dir.pop();
+        }
+        let cst = dir.join(format!(
+            "copilot-session-tui{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        assert!(
+            cst.exists(),
+            "the cst binary must exist at {} (cargo test builds it)",
+            cst.display()
+        );
+
+        let sandbox = tempfile::tempdir().expect("sandbox directory");
+        let home = sandbox.path().join("home");
+        std::fs::create_dir_all(home.join("session-state")).unwrap();
+        let bin = sandbox.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let log = sandbox.path().join("invocations.log");
+
+        let shim_src = sandbox.path().join("copilot_shim.rs");
+        std::fs::write(
+            &shim_src,
+            r#"
+use std::io::Write;
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Ok(log) = std::env::var("CST_E2E_LOG") {
+        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(log).unwrap();
+        writeln!(file, "{}", args.join(" ")).unwrap();
+    }
+    if args.iter().any(|arg| arg == "--version") {
+        println!("1.99.0 (fake copilot for the CST restart e2e)");
+        return;
+    }
+    if args.iter().any(|arg| arg.starts_with("--session-id=")) {
+        println!("FAKE COPILOT STARTED");
+        std::io::stdout().flush().unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        std::process::exit(134);
+    }
+    if let Some(id) = args.iter().find_map(|arg| arg.strip_prefix("--resume=")) {
+        println!("FAKE COPILOT RESUMED {id}");
+        std::io::stdout().flush().unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(600));
+        return;
+    }
+    std::process::exit(1);
+}
+"#,
+        )
+        .unwrap();
+        let compiled = std::process::Command::new("rustc")
+            .arg(&shim_src)
+            .arg("-o")
+            .arg(bin.join(format!("copilot{}", std::env::consts::EXE_SUFFIX)))
+            .status()
+            .expect("rustc must be available to build the stand-in Copilot");
+        assert!(compiled.success(), "stand-in Copilot failed to compile");
+
+        let path = std::env::join_paths(std::iter::once(bin.clone()).chain(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        )))
+        .unwrap();
+        std::env::set_var("PATH", &path);
+        std::env::set_var("CST_E2E_LOG", &log);
+
+        let (tx, rx) = mpsc::channel();
+        let mut pane = Pane::spawn(
+            PaneSpec {
+                id: 1,
+                title: "e2e driver".to_string(),
+                cwd: sandbox.path().to_path_buf(),
+                session_id: "e2e-driver".to_string(),
+                program: cst.to_string_lossy().into_owned(),
+                args: vec![
+                    "--mux".to_string(),
+                    "--copilot-home".to_string(),
+                    home.to_string_lossy().into_owned(),
+                ],
+                events_path: None,
+                terminal_light_mode: Some(false),
+                hooks_active: false,
+            },
+            35,
+            120,
+            tx,
+        )
+        .expect("cst must start inside the PTY");
+
+        fn wait_for(pane: &Pane, rx: &Receiver<MuxEvent>, needle: &str) -> String {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut contents = String::new();
+            while Instant::now() < deadline {
+                let _ = rx.recv_timeout(Duration::from_millis(200));
+                contents = pane.with_screen(|screen| screen.contents()).unwrap();
+                if contents.contains(needle) {
+                    return contents;
+                }
+            }
+            panic!("never saw {needle:?} on screen; last frame:\n{contents}");
+        }
+
+        wait_for(&pane, &rx, "Start a new session here");
+        // A machine whose last-ran marker is older than this build gets the What's
+        // new screen on top of the list; it eats every key until dismissed.
+        if pane
+            .with_screen(|screen| screen.contents())
+            .unwrap()
+            .contains("What's new")
+        {
+            pane.send_key(&KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                let _ = rx.recv_timeout(Duration::from_millis(200));
+                let contents = pane.with_screen(|screen| screen.contents()).unwrap();
+                if !contents.contains("What's new") {
+                    break;
+                }
+            }
+        }
+        pane.send_key(&KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
+            .unwrap();
+        wait_for(&pane, &rx, "FAKE COPILOT STARTED");
+        wait_for(&pane, &rx, "exited with code 134");
+        wait_for(&pane, &rx, "r restart");
+        pane.send_key(&KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE))
+            .unwrap();
+        wait_for(&pane, &rx, "FAKE COPILOT RESUMED");
+
+        let invocations = std::fs::read_to_string(&log).unwrap();
+        let crashed = invocations
+            .lines()
+            .find_map(|line| {
+                line.split_whitespace()
+                    .find_map(|arg| arg.strip_prefix("--session-id="))
+            })
+            .expect("the crashed launch must have been given a session id")
+            .to_string();
+        assert!(
+            invocations.contains(&format!("--resume={crashed}")),
+            "r must resume the very session that crashed: {invocations}"
+        );
+
+        let _ = pane.kill();
+    }
+
     #[test]
     fn a_dead_pane_offers_its_session_for_restart_keeping_its_slot_in_the_tab_strip() {
         let mut app = attached_mux_app("one");
