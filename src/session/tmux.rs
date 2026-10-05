@@ -518,28 +518,38 @@ fn registry_path() -> PathBuf {
         .join("tmux-sessions.json")
 }
 
+/// A registry that cannot be read must never block resuming sessions: the worst
+/// correct outcome of losing it is that CST forgets which tmux sessions it owned,
+/// which `tmux attach` can recover from by hand. A corrupt or future-version file is
+/// therefore moved aside for inspection and treated as empty, not surfaced as an
+/// error — an error here would propagate into every resume path, tmux-backed or not.
 fn load_unlocked(path: &Path) -> Result<Registry> {
+    let empty = Registry {
+        version: REGISTRY_VERSION,
+        sessions: Vec::new(),
+    };
     match fs::read_to_string(path) {
         Ok(content) => {
-            let registry: Registry = serde_json::from_str(&content)
-                .with_context(|| format!("Invalid tmux registry: {}", path.display()))?;
-            if registry.version != REGISTRY_VERSION {
-                anyhow::bail!(
-                    "Unsupported tmux registry version {} in {}",
-                    registry.version,
-                    path.display()
-                );
-            }
+            let registry = match serde_json::from_str::<Registry>(&content) {
+                Ok(registry) if registry.version == REGISTRY_VERSION => registry,
+                Ok(_) | Err(_) => {
+                    quarantine_registry(path);
+                    empty
+                }
+            };
             Ok(registry)
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Registry {
-            version: REGISTRY_VERSION,
-            sessions: Vec::new(),
-        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(empty),
         Err(error) => {
             Err(error).with_context(|| format!("Failed to read tmux registry: {}", path.display()))
         }
     }
+}
+
+/// Best effort: keep the bad bytes next to the registry for debugging. If even the
+/// rename fails the next save overwrites the file, which is still the right outcome.
+fn quarantine_registry(path: &Path) {
+    let _ = fs::rename(path, path.with_extension("json.bad"));
 }
 
 fn save_unlocked(path: &Path, registry: &Registry) -> Result<()> {
@@ -640,6 +650,32 @@ mod tests {
         let loaded = load_unlocked(&path).unwrap();
 
         assert_eq!(loaded.sessions, vec![reference]);
+    }
+
+    #[test]
+    fn a_damaged_registry_is_quarantined_instead_of_blocking_every_resume() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("tmux-sessions.json");
+        fs::write(&path, "{ not json").unwrap();
+
+        let loaded = load_unlocked(&path).unwrap();
+
+        assert!(loaded.sessions.is_empty());
+        let quarantined = path.with_extension("json.bad");
+        assert_eq!(fs::read_to_string(&quarantined).unwrap(), "{ not json");
+        assert!(!path.exists(), "the bad file must be moved, not kept");
+    }
+
+    #[test]
+    fn a_future_registry_version_is_set_aside_rather_than_erroring_after_a_downgrade() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("tmux-sessions.json");
+        fs::write(&path, r#"{"version": 2, "sessions": []}"#).unwrap();
+
+        let loaded = load_unlocked(&path).unwrap();
+
+        assert!(loaded.sessions.is_empty());
+        assert!(path.with_extension("json.bad").exists());
     }
 
     #[test]
