@@ -484,6 +484,10 @@ fn handle_pane_list(app: &mut App, key: KeyCode) {
                 format!("Ended '{title}'")
             });
         }
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.mode = Mode::Normal;
+        }
+        // Last on purpose, so a configured end key can never shadow a built-in.
         key if app.tmux_support.is_available() && app.config.tmux_keys.matches_end_session(key) => {
             let index = app.pane_selected.min(count - 1);
             let session_id = app
@@ -494,12 +498,23 @@ fn handle_pane_list(app: &mut App, key: KeyCode) {
                 .expect("pane index checked above");
             request_end_tmux_session(app, &session_id);
         }
-        KeyCode::Esc | KeyCode::Char('q') => {
-            app.mode = Mode::Normal;
-        }
         _ => {}
     }
 }
+
+/// Every character `handle_pane_list` above claims. The configured tmux end key — the
+/// one tmux shortcut that also fires in the pane switcher — is validated against this
+/// and matched after these, so drift here makes a configured key inert, never hijacked.
+pub(crate) const PANE_LIST_COMMAND_KEYS: &[char] = &[
+    'k', 'j', 'x', 'q', '1', '2', '3', '4', '5', '6', '7', '8', '9',
+];
+
+/// Every character `handle_normal` below claims in list mode. All four configured tmux
+/// shortcuts are validated against this and matched after these.
+pub(crate) const LIST_COMMAND_KEYS: &[char] = &[
+    'q', 'k', 'j', '/', 'r', 'e', 'g', 'T', ' ', 'd', 'f', 'p', 's', 'H', 'c', 'n', 'N', '?', ',',
+    '.', 'u',
+];
 
 fn handle_normal(app: &mut App, key: KeyCode) {
     // A grabbed favorite takes over the arrow keys, so this runs first.
@@ -527,27 +542,6 @@ fn handle_normal(app: &mut App, key: KeyCode) {
             _ => {
                 app.release_favorite_grab();
             }
-        }
-    }
-
-    // Where tmux cannot work these keys stay exactly as inert as they are on a build
-    // without the feature, rather than answering every press with an error.
-    if app.tmux_support.is_available() {
-        if app.config.tmux_keys.matches_new_session(key) {
-            start_tmux_session(app);
-            return;
-        }
-        if app.config.tmux_keys.matches_resume_session(key) {
-            resume_selected_in_tmux(app);
-            return;
-        }
-        if app.config.tmux_keys.matches_new_worktree(key) {
-            begin_tmux_worktree_session(app);
-            return;
-        }
-        if app.config.tmux_keys.matches_end_session(key) {
-            request_end_selected_tmux_session(app);
-            return;
         }
     }
 
@@ -633,7 +627,27 @@ fn handle_normal(app: &mut App, key: KeyCode) {
         }
         KeyCode::Char('.') => begin_project_settings(app),
         KeyCode::Char('u') => app.request_update(),
-        _ => {}
+        // Configured tmux shortcuts come last on purpose: whatever validation let
+        // through, a configured key can shadow nothing — at worst it is inert.
+        _ => handle_tmux_shortcut(app, key),
+    }
+}
+
+/// The session-list tmux shortcuts, reachable only for keys no built-in command claims.
+fn handle_tmux_shortcut(app: &mut App, key: KeyCode) {
+    if !app.tmux_support.is_available() {
+        // Where tmux cannot work these keys stay exactly as inert as they are on a
+        // build without the feature, rather than answering every press with an error.
+        return;
+    }
+    if app.config.tmux_keys.matches_new_session(key) {
+        start_tmux_session(app);
+    } else if app.config.tmux_keys.matches_resume_session(key) {
+        resume_selected_in_tmux(app);
+    } else if app.config.tmux_keys.matches_new_worktree(key) {
+        begin_tmux_worktree_session(app);
+    } else if app.config.tmux_keys.matches_end_session(key) {
+        request_end_selected_tmux_session(app);
     }
 }
 
@@ -2286,6 +2300,21 @@ mod tests {
         assert!(app.terminal.active_session_id().is_none());
         assert!(!app.terminal.is_visible());
         assert!(app.status_message.is_none());
+    }
+
+    #[test]
+    fn a_tmux_key_that_slips_past_validation_can_never_steal_a_built_in_command() {
+        let mut config = config::UserConfig::default();
+        // c clears the project filter; validation rejects this, so set it directly
+        // the way a future drift between the key tables would.
+        config.tmux_keys.end_session = "c".to_string();
+        let mut app = App::new(Vec::new(), config);
+        app.tmux_support = crate::session::tmux::TmuxSupport::Available;
+
+        handle_normal(&mut app, KeyCode::Char('c'));
+
+        assert_eq!(app.status_message.as_deref(), Some("Filter cleared"));
+        assert!(app.confirm_end_tmux.is_none());
     }
 
     #[test]

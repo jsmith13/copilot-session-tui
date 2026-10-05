@@ -202,6 +202,14 @@ pub fn resolve_prefix_command(key: &KeyEvent, prefix: &KeyChord) -> Option<Prefi
     resolve_prefix_command_with_tmux_keys(key, prefix, Some(&tmux_keys))
 }
 
+/// Every character the built-in match below claims. The configured tmux end key is
+/// validated against this and only consulted after the built-ins, so drift here makes
+/// a configured key inert — it can never steal a multiplexer command.
+pub(crate) const PREFIX_COMMAND_KEYS: &[char] = &[
+    'd', 'n', 'p', 'x', 'w', 'c', 'e', 't', 's', 'u', 'q', 'm', 'h', 'g', '0', '1', '2', '3', '4',
+    '5', '6', '7', '8', '9',
+];
+
 /// `tmux_keys` is `None` when tmux-backed sessions cannot work here, which keeps the
 /// configured end key as inert after the prefix as it would be on a build without
 /// the feature.
@@ -213,10 +221,7 @@ pub fn resolve_prefix_command_with_tmux_keys(
     if prefix.matches(key) {
         return Some(PrefixCommand::CommandPalette);
     }
-    if tmux_keys.is_some_and(|keys| keys.matches_end_session(key.code)) {
-        return Some(PrefixCommand::EndPersistentSession);
-    }
-    match key.code {
+    let builtin = match key.code {
         KeyCode::Char('d') => Some(PrefixCommand::Detach),
         KeyCode::Char('n') => Some(PrefixCommand::NextPane),
         KeyCode::Char('p') => Some(PrefixCommand::PreviousPane),
@@ -249,7 +254,16 @@ pub fn resolve_prefix_command_with_tmux_keys(
         }
         KeyCode::Esc => Some(PrefixCommand::Cancel),
         _ => None,
+    };
+    if builtin.is_some() {
+        return builtin;
     }
+    // Only a key no built-in claims can reach the configured tmux end shortcut, so a
+    // bad configuration is at worst inert.
+    if tmux_keys.is_some_and(|keys| keys.matches_end_session(key.code)) {
+        return Some(PrefixCommand::EndPersistentSession);
+    }
+    None
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

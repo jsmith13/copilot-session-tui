@@ -924,6 +924,12 @@ pub fn validate_user_notification_config(config: &UserConfig) -> Result<()> {
     Ok(())
 }
 
+/// The conflict sets come from the key tables next to the real matches
+/// (`input::LIST_COMMAND_KEYS`, `input::PANE_LIST_COMMAND_KEYS`,
+/// `mux::PREFIX_COMMAND_KEYS`) instead of a copy here, which has already drifted
+/// once. The handlers also match configured shortcuts only after their built-ins,
+/// so a conflict that slips past this check makes the shortcut inert — it can
+/// never steal an existing command.
 pub fn validate_tmux_keys(keys: &TmuxKeyConfig) -> Result<()> {
     let configured = [
         ("resume_session", keys.resume_session.as_str(), false),
@@ -947,54 +953,22 @@ pub fn validate_tmux_keys(keys: &TmuxKeyConfig) -> Result<()> {
         if !seen.insert(character) {
             anyhow::bail!("tmux shortcut '{character}' is assigned more than once");
         }
-        if !used_after_prefix
-            && matches!(
-                character,
-                'q' | 'k'
-                    | 'j'
-                    | 'r'
-                    | 'e'
-                    | 'g'
-                    | 'T'
-                    | ' '
-                    | 'd'
-                    | 'f'
-                    | 'p'
-                    | 's'
-                    | 'c'
-                    | 'n'
-                    | 'N'
-                    | '?'
-                    | ','
-                    | '.'
-                    | 'u'
-            )
-        {
+        // Every configured shortcut fires in the session list, so all four are
+        // checked against it; only the end key also fires after the prefix and in
+        // the pane switcher.
+        if crate::input::LIST_COMMAND_KEYS.contains(&character) {
             anyhow::bail!(
                 "tmux shortcut '{character}' conflicts with an existing session-list command"
             );
         }
-        if used_after_prefix
-            && matches!(
-                character,
-                'd' | 'n'
-                    | 'p'
-                    | 'x'
-                    | 'w'
-                    | 'c'
-                    | 'e'
-                    | 't'
-                    | 's'
-                    | 'u'
-                    | 'q'
-                    | 'm'
-                    | 'h'
-                    | 'g'
-                    | '0'..='9'
-            )
-        {
+        if used_after_prefix && crate::mux::PREFIX_COMMAND_KEYS.contains(&character) {
             anyhow::bail!(
                 "tmux shortcut '{character}' conflicts with an existing multiplexer command"
+            );
+        }
+        if used_after_prefix && crate::input::PANE_LIST_COMMAND_KEYS.contains(&character) {
+            anyhow::bail!(
+                "tmux shortcut '{character}' conflicts with an existing pane-switcher command"
             );
         }
     }
@@ -1486,6 +1460,30 @@ mod tests {
             ..TmuxKeyConfig::default()
         };
         assert!(validate_tmux_keys(&invalid).is_err());
+    }
+
+    #[test]
+    fn tmux_shortcut_conflicts_are_checked_against_every_surface_the_key_fires_in() {
+        // k navigates both the session list and the pane switcher. A hand-kept copy
+        // of the bindings once let it through for end_session because end_session was
+        // only compared against the prefix commands.
+        let end_steals_navigation = TmuxKeyConfig {
+            end_session: "k".to_string(),
+            ..TmuxKeyConfig::default()
+        };
+        assert!(validate_tmux_keys(&end_steals_navigation).is_err());
+
+        // / (search) and H (hidden sessions) were missing from the copied list.
+        let resume_steals_search = TmuxKeyConfig {
+            resume_session: "/".to_string(),
+            ..TmuxKeyConfig::default()
+        };
+        assert!(validate_tmux_keys(&resume_steals_search).is_err());
+        let resume_steals_hidden = TmuxKeyConfig {
+            resume_session: "H".to_string(),
+            ..TmuxKeyConfig::default()
+        };
+        assert!(validate_tmux_keys(&resume_steals_hidden).is_err());
     }
 
     #[test]
