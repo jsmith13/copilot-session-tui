@@ -618,6 +618,9 @@ struct ResolvedReferences {
 struct PendingExternalSession {
     next_attempt: Instant,
     deadline: Instant,
+    /// What was selected when the launch started; focus only moves to the new
+    /// session if the user has not selected something else in the meantime.
+    selection_at_launch: Option<String>,
 }
 
 pub struct App {
@@ -2761,11 +2764,13 @@ impl App {
 
     pub fn track_external_session(&mut self, session_id: String) {
         let now = Instant::now();
+        let selection_at_launch = self.selected_session().map(|session| session.id.clone());
         self.pending_external_sessions.insert(
             session_id,
             PendingExternalSession {
                 next_attempt: now,
                 deadline: now + Duration::from_secs(60),
+                selection_at_launch,
             },
         );
     }
@@ -2781,9 +2786,18 @@ impl App {
         for session_id in due {
             match crate::session::loader::load_session(&self.copilot_home, &session_id) {
                 Ok(Some(session)) => {
-                    self.pending_external_sessions.remove(&session_id);
+                    let pending = self.pending_external_sessions.remove(&session_id);
+                    // Copilot can take many seconds to write its metadata. If the user
+                    // has moved on in the meantime, yanking the selection back to the
+                    // launched session would undo what they just did.
+                    let selection_untouched = pending.is_some_and(|pending| {
+                        self.selected_session().map(|session| session.id.as_str())
+                            == pending.selection_at_launch.as_deref()
+                    });
                     self.merge_session_metadata(vec![session]);
-                    self.focus_session(&session_id);
+                    if selection_untouched {
+                        self.focus_session(&session_id);
+                    }
                 }
                 Ok(None) => {
                     let expired = self
@@ -5229,6 +5243,50 @@ mod tests {
         assert_eq!(
             app.selected_session().unwrap().display_name(),
             "External tmux session"
+        );
+    }
+
+    #[test]
+    fn a_slow_tmux_launch_does_not_steal_a_selection_the_user_has_since_moved() {
+        let home = tempfile::tempdir().unwrap();
+        let session_dir = home.path().join("session-state").join("external-session");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(
+            session_dir.join("workspace.yaml"),
+            format!(
+                "id: external-session\ncwd: {}\nname: External tmux session\n",
+                home.path().display()
+            ),
+        )
+        .unwrap();
+
+        let mut app = App::new(
+            vec![
+                session("first-session", "project-a", "2026-08-21T12:00:00Z"),
+                session("other-session", "project-b", "2026-08-21T13:00:00Z"),
+            ],
+            UserConfig::default(),
+        );
+        app.copilot_home = home.path().to_path_buf();
+        app.focus_session("first-session");
+        app.track_external_session("external-session".to_string());
+        // Copilot can take many seconds to write its metadata; meanwhile the user
+        // selects something else.
+        app.focus_session("other-session");
+
+        app.poll_external_sessions();
+
+        assert!(app.pending_external_sessions.is_empty());
+        assert_eq!(
+            app.selected_session().unwrap().id,
+            "other-session",
+            "the user's selection must survive the late metadata arrival"
+        );
+        assert!(
+            app.sessions
+                .iter()
+                .any(|session| session.id == "external-session"),
+            "the new session is still merged into the list"
         );
     }
 
