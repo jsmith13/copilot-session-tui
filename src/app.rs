@@ -4336,6 +4336,11 @@ impl App {
     /// indefinitely.
     const WAKE_PATIENCE_SECS: i64 = 300;
 
+    /// How stale a waiting notice's clock may get while its pane works before it is
+    /// restarted. Restarting on every pass would rewrite `threads.json` several times a
+    /// second for the length of the turn; this costs at most a minute of patience.
+    const WORKING_CLOCK_SLACK_SECS: i64 = 60;
+
     /// Act on the notices the watcher wrote down, now that pane state is knowable.
     ///
     /// The watcher settles *whether* a comment should reach a session and records that
@@ -4407,6 +4412,13 @@ impl App {
             }
             // A long turn is not a closed session. Keep its persisted notice eligible
             // until the ready hook arrives instead of requiring a new comment to retry.
+            //
+            // The clock restarts while it waits, so patience is measured from the end
+            // of the turn. Otherwise a turn that ends on a question for the user, or
+            // with a draft in the composer, would hold the notice at once instead of
+            // after the usual five minutes. The cost is that a turn which never ends
+            // keeps the notice queued for as long as it runs; the session list already
+            // shows that session as working, which is where somebody would look.
             if self
                 .mux
                 .as_ref()
@@ -4416,6 +4428,13 @@ impl App {
                 })
                 .is_some_and(|pane| pane.is_working())
             {
+                if age >= Self::WORKING_CLOCK_SLACK_SECS {
+                    self.update_threads(|state| {
+                        if let Some(notice) = state.notice_mut(&session_id, &thread) {
+                            notice.planned_at = chrono::Utc::now();
+                        }
+                    });
+                }
                 continue;
             }
             // Readiness is re-asked per notice rather than decided once up front:

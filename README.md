@@ -769,8 +769,8 @@ with how long they have waited, and under **Waiting for you** in the command pal
 
 Replies to a working session stay queued until its current turn finishes, even when that
 turn takes longer than five minutes. CST never injects them into a working turn or an
-unsent draft. An unattended draft or user-action prompt still sends a notice to **Waiting
-for you** after it has waited five minutes.
+unsent draft. If the turn ends on a question for you, or with a draft left in the
+composer, the reply waits about five more minutes and then moves to **Waiting for you**.
 
 To work with a colleague's agent, name them:
 
