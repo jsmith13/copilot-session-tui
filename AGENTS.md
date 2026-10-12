@@ -56,9 +56,10 @@ that name them. If a change makes one of those tests fail, the change is wrong.
   anyone who can reach the thread, and a session may be running with `--yolo` in a real
   repository. `threads::judge` is the single exception and pays for it: no tools, no
   repository, an empty working directory.
-- **A comment from a login that is not ours never starts anything.** It becomes a pending
-  item for the user. Every CST agent posts as the same account, so a different author is
-  by definition somebody outside.
+- **A comment from a login that is not ours never starts anything.** It is ignored, and
+  the user is not asked about it either. Every CST agent posts as the same account, so a
+  different author is by definition somebody outside. The only way to let one in is the
+  `thread_trusted_authors` list, which the user writes out.
 
 A third thing, recorded because it looks like an obvious optimisation and is a dead end:
 **do not poll `GET /notifications`.** One conditional request covering every subscription

@@ -33,8 +33,8 @@ use crate::mux::MuxEvent;
 /// tested without a network, an account, or a running session.
 ///
 /// Comments are marked seen whatever the outcome. A comment that was examined and
-/// deliberately not delivered must not be examined again on the next poll, or a thread
-/// with one foreign comment would re-raise the same notice every minute.
+/// deliberately not delivered must not be examined again on the next poll, or a
+/// throttled thread would raise the same notice again every minute.
 ///
 /// Reports whether this batch produced anything for anybody, which is all the caller
 /// needs: the notices themselves are already on the state, and what happens to one next
@@ -79,17 +79,7 @@ pub fn plan(
             }
 
             match classify(comment, our_login, trusted, subscription) {
-                Verdict::SkipOwn => {}
-                Verdict::HoldForUser(reason) => {
-                    recorded.push(Notice {
-                        session_id: session_id.clone(),
-                        thread: thread.clone(),
-                        comment_url: comment.url.clone(),
-                        author: Some(comment.author.clone()),
-                        status: NoticeStatus::Waiting { reason },
-                        planned_at: now,
-                    });
-                }
+                Verdict::SkipOwn | Verdict::Ignore => {}
                 Verdict::Wake => {
                     if already_woken {
                         continue;
@@ -522,9 +512,36 @@ mod tests {
     }
 
     #[test]
-    fn an_outsiders_comment_is_held_for_the_user_and_starts_nothing() {
+    fn an_outsiders_comment_starts_nothing_and_asks_the_user_nothing() {
         // The security property, tested where it actually takes effect rather than only
-        // on the rule in isolation: no Wake may appear for a foreign author, ever.
+        // on the rule in isolation: no Wake may appear for a foreign author, ever. And
+        // no question either, or a busy public thread fills the inbox with them.
+        let mut state = state_with(&["session-a"]);
+
+        let produced = plan(
+            &mut state,
+            &thread(),
+            &[comment("1", "a-stranger")],
+            "tupini07",
+            &[],
+            12,
+            Utc::now(),
+        );
+
+        assert!(!produced);
+        assert!(recorded(&state).is_empty(), "got: {:?}", recorded(&state));
+        // Still marked seen, so it is not reconsidered on every poll.
+        assert!(state
+            .subscription_mut("session-a", &thread())
+            .unwrap()
+            .has_seen("1"));
+    }
+
+    #[test]
+    fn an_outsiders_comment_does_not_stand_between_a_session_and_our_own_reply() {
+        // Under the old rule the stranger's comment became a held notice, and with one
+        // notice per thread every later reply from our own side was folded into it and
+        // never delivered.
         let mut state = state_with(&["session-a"]);
 
         plan(
@@ -536,20 +553,23 @@ mod tests {
             12,
             Utc::now(),
         );
-        let deliveries = recorded(&state);
+        plan(
+            &mut state,
+            &thread(),
+            &[comment("2", "tupini07")],
+            "tupini07",
+            &[],
+            12,
+            Utc::now(),
+        );
 
         assert_eq!(
-            deliveries,
-            vec![Delivery::Held {
+            recorded(&state),
+            vec![Delivery::Wake {
                 session_id: "session-a".to_string(),
                 thread: thread(),
-                reason: PendingReason::ForeignAuthor,
             }]
         );
-        assert!(!deliveries
-            .iter()
-            .any(|delivery| matches!(delivery, Delivery::Wake { .. })));
-        assert_eq!(state.waiting_for_user().len(), 1);
     }
 
     #[test]
@@ -576,7 +596,7 @@ mod tests {
 
     #[test]
     fn a_comment_examined_once_is_not_examined_again_on_the_next_poll() {
-        // Without this a single foreign comment would re-raise its notice every minute.
+        // Without this the same comment would wake the session again on every poll.
         let mut state = state_with(&["session-a"]);
         let comments = [comment("1", "tupini07")];
 
@@ -750,20 +770,7 @@ mod tests {
             12,
             Utc::now(),
         );
-        assert_eq!(
-            recorded(&state),
-            vec![Delivery::Held {
-                session_id: "session-a".to_string(),
-                thread: thread(),
-                reason: PendingReason::ForeignAuthor,
-            }]
-        );
-        // And the held one names who wrote it, which is what the user needs in order to
-        // decide whether to add them to the list.
-        assert_eq!(
-            state.waiting_for_user()[0].author.as_deref(),
-            Some("a-stranger")
-        );
+        assert!(recorded(&state).is_empty(), "got: {:?}", recorded(&state));
     }
 
     #[test]

@@ -24,7 +24,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use super::{Notice, NoticeStatus, PendingDelivery, PendingReason, Subscription, ThreadRef};
+use super::{Notice, NoticeStatus, PendingDelivery, Subscription, ThreadRef};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThreadState {
@@ -149,22 +149,18 @@ impl ThreadState {
             // read this thread", and walking it back to planned would send the same
             // link a second time.
             //
-            // A notice held because the session was unreachable or the thread was
-            // throttled is different. Those reasons describe the moment it was held,
-            // and a fresh wake is evidence that moment has passed — left alone, one
-            // held notice would silently absorb every later wake on the thread for as
-            // long as nobody opened the inbox. The clock restarts with it, or a notice
-            // held days ago would already be past the patience deadline and be held
-            // again on the first pass that found the pane busy.
+            // A held notice is different. Being unreachable or throttled describes the
+            // moment it was held, and a fresh wake is evidence that moment has passed —
+            // left alone, one held notice would silently absorb every later wake on the
+            // thread for as long as nobody opened the inbox. The clock restarts with
+            // it, or a notice held days ago would already be past the patience deadline
+            // and be held again on the first pass that found the pane busy.
             //
-            // A comment held for being written by someone else stays held. The user is
-            // being asked about that person, and with one notice per thread, promoting
-            // it would quietly withdraw the question.
+            // That includes a question about an outsider's comment left by an older
+            // CST. Those comments are ignored now, so the question no longer needs an
+            // answer, and it must not stand between the session and our own reply.
             let promote = notice.status == NoticeStatus::Planned
-                && matches!(
-                    existing.reason(),
-                    Some(PendingReason::SessionClosed | PendingReason::Throttled)
-                );
+                && matches!(existing.status, NoticeStatus::Waiting { .. });
             if promote {
                 existing.status = NoticeStatus::Planned;
                 existing.planned_at = notice.planned_at;
@@ -320,7 +316,7 @@ pub fn state_root() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::super::ThreadKind;
+    use super::super::{PendingReason, ThreadKind};
     use super::*;
     use chrono::{DateTime, Utc};
 
@@ -446,25 +442,28 @@ mod tests {
     }
 
     #[test]
-    fn a_wake_does_not_withdraw_a_question_the_user_is_being_asked_about_an_outsider() {
-        // One notice per thread, so promoting this one would drop the user's decision
-        // about a stranger's comment without them ever seeing it.
+    fn a_question_about_an_outsider_left_by_an_older_cst_does_not_swallow_our_own_reply() {
+        // Outsiders' comments are ignored now, but a threads.json written before that
+        // still holds the questions asked about them. Left alone, one would absorb
+        // every later wake on its thread, which is the bug this store was fixed for.
         let mut state = ThreadState::default();
-        let held_at = Utc::now() - chrono::Duration::hours(1);
-        state.record_notice(notice(
+        let mut legacy = notice(
             1,
             NoticeStatus::Waiting {
                 reason: PendingReason::ForeignAuthor,
             },
-            held_at,
-        ));
+            Utc::now() - chrono::Duration::days(3),
+        );
+        legacy.author = Some("a-stranger".to_string());
+        state.record_notice(legacy);
 
         state.record_notice(notice(2, NoticeStatus::Planned, Utc::now()));
 
-        let pending = state.waiting_for_user();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].reason(), Some(PendingReason::ForeignAuthor));
-        assert_eq!(pending[0].planned_at, held_at);
+        let current = state.notice_mut("session-a", &thread(1)).unwrap();
+        assert_eq!(current.status, NoticeStatus::Planned);
+        assert_eq!(current.author.as_deref(), Some("tupini07"));
+        assert!(current.comment_url.ends_with("-2"));
+        assert!(state.waiting_for_user().is_empty());
     }
 
     #[test]
