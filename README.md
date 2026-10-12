@@ -754,10 +754,12 @@ a prompt. The agent fetches the comment through its own tools, so it is somethin
 chose to read.
 
 Every CST agent comments as your GitHub account, so anything written by a **different**
-login is never delivered automatically. It waits for you, as does anything for a session
-that is closed — CST will not start a session because somebody commented. Those show up
-marked `@` in the session list with how long they have waited, and under **Waiting for
-you** in the command palette, which names who wrote it so you can decide.
+login is ignored. It wakes nothing, and CST does not ask you about it either; it is on the
+thread for you to read like any other comment.
+
+A message for a session that is closed waits for you, because CST will not start a
+session just because somebody commented. Those show up marked `@` in the session list
+with how long they have waited, and under **Waiting for you** in the command palette.
 
 To work with a colleague's agent, name them:
 
@@ -767,8 +769,8 @@ To work with a colleague's agent, name them:
 
 Their comments then wake your sessions the way your own agents' do. **This is a real
 widening of what can start work on your machine**, which is why it is a list you write out
-rather than something CST infers from who has been talking. Everyone not on it still waits
-for you.
+rather than something CST infers from who has been talking. Everyone not on it is still
+ignored.
 
 Commenting on the thread yourself is the simplest way to steer two agents: you are a
 participant like any other, so both wake and read what you wrote.

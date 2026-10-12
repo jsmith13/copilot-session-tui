@@ -145,11 +145,26 @@ impl ThreadState {
         {
             existing.comment_url = notice.comment_url;
             existing.author = notice.author.or(existing.author.take());
-            // The status is left exactly as it was. Wherever the existing notice has got
-            // to — queued, sitting in a composer, or in front of the user — it already
-            // says "go and read this thread", and the new comment is on that same
-            // thread. Overwriting it would walk a notice already delivered back to
-            // planned and send the same link a second time.
+            // A queued or delivered notice keeps its status: it already says "go and
+            // read this thread", and walking it back to planned would send the same
+            // link a second time.
+            //
+            // A held notice is different. Being unreachable or throttled describes the
+            // moment it was held, and a fresh wake is evidence that moment has passed —
+            // left alone, one held notice would silently absorb every later wake on the
+            // thread for as long as nobody opened the inbox. The clock restarts with
+            // it, or a notice held days ago would already be past the patience deadline
+            // and be held again on the first pass that found the pane busy.
+            //
+            // That includes a question about an outsider's comment left by an older
+            // CST. Those comments are ignored now, so the question no longer needs an
+            // answer, and it must not stand between the session and our own reply.
+            let promote = notice.status == NoticeStatus::Planned
+                && matches!(existing.status, NoticeStatus::Waiting { .. });
+            if promote {
+                existing.status = NoticeStatus::Planned;
+                existing.planned_at = notice.planned_at;
+            }
             return;
         }
         self.notices.push(notice);
@@ -303,6 +318,7 @@ pub fn state_root() -> PathBuf {
 mod tests {
     use super::super::{PendingReason, ThreadKind};
     use super::*;
+    use chrono::{DateTime, Utc};
 
     fn thread(number: u64) -> ThreadRef {
         ThreadRef {
@@ -389,6 +405,80 @@ mod tests {
             pending[0].comment_url.ends_with("-4"),
             "newest comment wins"
         );
+    }
+
+    fn notice(id: u64, status: NoticeStatus, planned_at: DateTime<Utc>) -> Notice {
+        Notice {
+            session_id: "session-a".to_string(),
+            thread: thread(1),
+            comment_url: format!("https://github.com/o/r/issues/1#issuecomment-{id}"),
+            author: Some("tupini07".to_string()),
+            status,
+            planned_at,
+        }
+    }
+
+    #[test]
+    fn a_wake_arriving_while_a_notice_is_held_puts_it_back_in_the_queue_with_a_fresh_clock() {
+        // The reported failure: a notice held three days earlier absorbed every later
+        // reply on the thread, so a session that was open and waiting never heard of
+        // any of them.
+        for reason in [PendingReason::SessionClosed, PendingReason::Throttled] {
+            let mut state = ThreadState::default();
+            let held_at = Utc::now() - chrono::Duration::days(3);
+            let woken_at = Utc::now();
+            state.record_notice(notice(1, NoticeStatus::Waiting { reason }, held_at));
+
+            state.record_notice(notice(2, NoticeStatus::Planned, woken_at));
+
+            let current = state.notice_mut("session-a", &thread(1)).unwrap();
+            assert_eq!(current.status, NoticeStatus::Planned, "held as {reason:?}");
+            // An old clock would put it straight past the patience deadline and have
+            // it held again on the first pass that found the pane busy.
+            assert_eq!(current.planned_at, woken_at, "held as {reason:?}");
+            assert!(current.comment_url.ends_with("-2"));
+            assert!(state.waiting_for_user().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_question_about_an_outsider_left_by_an_older_cst_does_not_swallow_our_own_reply() {
+        // Outsiders' comments are ignored now, but a threads.json written before that
+        // still holds the questions asked about them. Left alone, one would absorb
+        // every later wake on its thread, which is the bug this store was fixed for.
+        let mut state = ThreadState::default();
+        let mut legacy = notice(
+            1,
+            NoticeStatus::Waiting {
+                reason: PendingReason::ForeignAuthor,
+            },
+            Utc::now() - chrono::Duration::days(3),
+        );
+        legacy.author = Some("a-stranger".to_string());
+        state.record_notice(legacy);
+
+        state.record_notice(notice(2, NoticeStatus::Planned, Utc::now()));
+
+        let current = state.notice_mut("session-a", &thread(1)).unwrap();
+        assert_eq!(current.status, NoticeStatus::Planned);
+        assert_eq!(current.author.as_deref(), Some("tupini07"));
+        assert!(current.comment_url.ends_with("-2"));
+        assert!(state.waiting_for_user().is_empty());
+    }
+
+    #[test]
+    fn a_wake_arriving_while_a_notice_is_queued_or_delivered_does_not_send_the_link_twice() {
+        for status in [NoticeStatus::Planned, NoticeStatus::Sent] {
+            let mut state = ThreadState::default();
+            let first = Utc::now() - chrono::Duration::minutes(2);
+            state.record_notice(notice(1, status, first));
+
+            state.record_notice(notice(2, NoticeStatus::Planned, Utc::now()));
+
+            let current = state.notice_mut("session-a", &thread(1)).unwrap();
+            assert_eq!(current.status, status);
+            assert_eq!(current.planned_at, first, "{status:?} keeps its deadline");
+        }
     }
 
     #[test]

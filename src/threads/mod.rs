@@ -210,8 +210,8 @@ pub enum Verdict {
     SkipOwn,
     /// Another CST agent, or the user commenting from a browser. Wake the session.
     Wake,
-    /// Written by somebody who is not us. Ask the user before anything runs.
-    HoldForUser(PendingReason),
+    /// Written by somebody who is not us. Nothing runs, and the user is not asked.
+    Ignore,
 }
 
 /// Why a message is waiting on the user instead of going straight to a session.
@@ -221,6 +221,11 @@ pub enum PendingReason {
     /// The session has no running pane, and CST does not start one unasked.
     SessionClosed,
     /// Written by a login that is not the one our agents post as.
+    ///
+    /// No longer produced, because such comments are now ignored. It stays so that a
+    /// `threads.json` written by an older CST still loads: `load_in` reads a file it
+    /// cannot parse as empty, so dropping a variant a file still holds would drop every
+    /// subscription with it.
     ForeignAuthor,
     /// This thread has woken this session too many times in the last hour.
     Throttled,
@@ -265,7 +270,11 @@ pub fn classify(
         {
             return Verdict::Wake;
         }
-        return Verdict::HoldForUser(PendingReason::ForeignAuthor);
+        // Ignored rather than raised with the user. Asking about every stranger's
+        // comment turned a busy public thread into a queue of questions whose only safe
+        // answer was "no". Somebody whose comments should start work goes on the
+        // trusted list instead.
+        return Verdict::Ignore;
     }
     if subscription
         .authored_comment_ids
@@ -556,7 +565,7 @@ mod tests {
     }
 
     #[test]
-    fn a_comment_from_an_outsider_is_held_for_the_user_and_never_wakes_anything() {
+    fn a_comment_from_an_outsider_is_ignored_and_never_wakes_anything() {
         // The security property. A stranger commenting on a public thread must not be
         // able to start work on this machine.
         let subscription = Subscription::new("session-a", thread());
@@ -568,7 +577,7 @@ mod tests {
                 &[],
                 &subscription
             ),
-            Verdict::HoldForUser(PendingReason::ForeignAuthor)
+            Verdict::Ignore
         );
     }
 
@@ -605,7 +614,7 @@ mod tests {
                 &trusted,
                 &subscription
             ),
-            Verdict::HoldForUser(PendingReason::ForeignAuthor)
+            Verdict::Ignore
         );
     }
 
@@ -617,7 +626,7 @@ mod tests {
 
         assert_eq!(
             classify(&sighting("103", "anyone"), "tupini07", &[], &subscription),
-            Verdict::HoldForUser(PendingReason::ForeignAuthor)
+            Verdict::Ignore
         );
     }
 

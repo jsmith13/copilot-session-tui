@@ -33,8 +33,8 @@ use crate::mux::MuxEvent;
 /// tested without a network, an account, or a running session.
 ///
 /// Comments are marked seen whatever the outcome. A comment that was examined and
-/// deliberately not delivered must not be examined again on the next poll, or a thread
-/// with one foreign comment would re-raise the same notice every minute.
+/// deliberately not delivered must not be examined again on the next poll, or a
+/// throttled thread would raise the same notice again every minute.
 ///
 /// Reports whether this batch produced anything for anybody, which is all the caller
 /// needs: the notices themselves are already on the state, and what happens to one next
@@ -79,17 +79,7 @@ pub fn plan(
             }
 
             match classify(comment, our_login, trusted, subscription) {
-                Verdict::SkipOwn => {}
-                Verdict::HoldForUser(reason) => {
-                    recorded.push(Notice {
-                        session_id: session_id.clone(),
-                        thread: thread.clone(),
-                        comment_url: comment.url.clone(),
-                        author: Some(comment.author.clone()),
-                        status: NoticeStatus::Waiting { reason },
-                        planned_at: now,
-                    });
-                }
+                Verdict::SkipOwn | Verdict::Ignore => {}
                 Verdict::Wake => {
                     if already_woken {
                         continue;
@@ -522,9 +512,36 @@ mod tests {
     }
 
     #[test]
-    fn an_outsiders_comment_is_held_for_the_user_and_starts_nothing() {
+    fn an_outsiders_comment_starts_nothing_and_asks_the_user_nothing() {
         // The security property, tested where it actually takes effect rather than only
-        // on the rule in isolation: no Wake may appear for a foreign author, ever.
+        // on the rule in isolation: no Wake may appear for a foreign author, ever. And
+        // no question either, or a busy public thread fills the inbox with them.
+        let mut state = state_with(&["session-a"]);
+
+        let produced = plan(
+            &mut state,
+            &thread(),
+            &[comment("1", "a-stranger")],
+            "tupini07",
+            &[],
+            12,
+            Utc::now(),
+        );
+
+        assert!(!produced);
+        assert!(recorded(&state).is_empty(), "got: {:?}", recorded(&state));
+        // Still marked seen, so it is not reconsidered on every poll.
+        assert!(state
+            .subscription_mut("session-a", &thread())
+            .unwrap()
+            .has_seen("1"));
+    }
+
+    #[test]
+    fn an_outsiders_comment_does_not_stand_between_a_session_and_our_own_reply() {
+        // Under the old rule the stranger's comment became a held notice, and with one
+        // notice per thread every later reply from our own side was folded into it and
+        // never delivered.
         let mut state = state_with(&["session-a"]);
 
         plan(
@@ -536,20 +553,23 @@ mod tests {
             12,
             Utc::now(),
         );
-        let deliveries = recorded(&state);
+        plan(
+            &mut state,
+            &thread(),
+            &[comment("2", "tupini07")],
+            "tupini07",
+            &[],
+            12,
+            Utc::now(),
+        );
 
         assert_eq!(
-            deliveries,
-            vec![Delivery::Held {
+            recorded(&state),
+            vec![Delivery::Wake {
                 session_id: "session-a".to_string(),
                 thread: thread(),
-                reason: PendingReason::ForeignAuthor,
             }]
         );
-        assert!(!deliveries
-            .iter()
-            .any(|delivery| matches!(delivery, Delivery::Wake { .. })));
-        assert_eq!(state.waiting_for_user().len(), 1);
     }
 
     #[test]
@@ -576,7 +596,7 @@ mod tests {
 
     #[test]
     fn a_comment_examined_once_is_not_examined_again_on_the_next_poll() {
-        // Without this a single foreign comment would re-raise its notice every minute.
+        // Without this the same comment would wake the session again on every poll.
         let mut state = state_with(&["session-a"]);
         let comments = [comment("1", "tupini07")];
 
@@ -750,20 +770,7 @@ mod tests {
             12,
             Utc::now(),
         );
-        assert_eq!(
-            recorded(&state),
-            vec![Delivery::Held {
-                session_id: "session-a".to_string(),
-                thread: thread(),
-                reason: PendingReason::ForeignAuthor,
-            }]
-        );
-        // And the held one names who wrote it, which is what the user needs in order to
-        // decide whether to add them to the list.
-        assert_eq!(
-            state.waiting_for_user()[0].author.as_deref(),
-            Some("a-stranger")
-        );
+        assert!(recorded(&state).is_empty(), "got: {:?}", recorded(&state));
     }
 
     #[test]
@@ -1128,6 +1135,164 @@ mod tests {
             survivor.comment_url
         );
         println!("survived a restart pointing at {}", survivor.comment_url);
+    }
+
+    /// The reported failure, reproduced against real GitHub.
+    ///
+    /// A notice held days earlier as "its session is closed" sat on the thread, and the
+    /// replies that arrived after it were folded into it and never delivered. Offline
+    /// tests cover `record_notice`; this one proves the whole path from a comment GitHub
+    /// really issued to a notice queued for delivery again, with a clock young enough
+    /// that the patience deadline does not hold it straight back.
+    ///
+    /// Posts a real comment on the configured thread each time it runs.
+    #[test]
+    #[ignore = "posts to a real GitHub issue; run with CST_THREADS_ROUNDTRIP=<issue url>"]
+    fn a_real_reply_puts_a_notice_held_days_ago_back_in_the_queue() {
+        let Ok(url) = std::env::var("CST_THREADS_ROUNDTRIP") else {
+            return;
+        };
+        let thread = super::super::parse_thread_url(&url).expect("a thread URL");
+        let root = tempfile::tempdir().unwrap();
+        let login = doorbell::current_login(&thread.host).expect("gh must be logged in");
+        let token = doorbell::token_for(&thread.host).expect("gh must have a token");
+        let transport = UreqTransport::new();
+        let held_at = Utc::now() - chrono::Duration::days(3);
+
+        store::update_in(root.path(), |state| {
+            state.subscribe("live-a", thread.clone());
+            state.record_notice(Notice {
+                session_id: "live-a".to_string(),
+                thread: thread.clone(),
+                comment_url: format!("{}#issuecomment-1", thread.url()),
+                author: Some(login.clone()),
+                status: NoticeStatus::Waiting {
+                    reason: PendingReason::SessionClosed,
+                },
+                planned_at: held_at,
+            });
+        })
+        .unwrap();
+        thread_moved(&transport, root.path(), &thread, &token).unwrap();
+
+        let report = super::super::cli::post(
+            root.path(),
+            "live-b",
+            &url,
+            &format!(
+                "Held-notice check at {}. A reply after a notice was held three days ago.",
+                Utc::now().to_rfc3339()
+            ),
+        )
+        .expect("posting should succeed");
+        let posted_url = report.lines().nth(1).expect("the report names the comment");
+
+        assert!(thread_moved(&transport, root.path(), &thread, &token).unwrap());
+        let comments = fetch_comments(
+            &thread,
+            root.path().to_path_buf(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("fetching comments should succeed");
+        store::update_in(root.path(), |state| {
+            plan(state, &thread, &comments, &login, &[], 12, Utc::now())
+        })
+        .unwrap();
+
+        let state = store::load_in(root.path());
+        let notice = state
+            .notices
+            .iter()
+            .find(|notice| notice.session_id == "live-a")
+            .expect("still one notice for the thread");
+        assert_eq!(notice.status, NoticeStatus::Planned, "got: {notice:?}");
+        assert!(notice.planned_at > held_at, "the clock must restart");
+        assert_eq!(notice.comment_url, posted_url);
+        assert!(state.waiting_for_user().is_empty());
+        println!("held notice re-queued, pointing at {}", notice.comment_url);
+    }
+
+    /// Strangers' comments on a real public thread, run through the rules.
+    ///
+    /// Read-only. Pretends a session joined the thread long ago, so every comment on it
+    /// counts as new, and that we are a login that never commented there. With real
+    /// authors, real ids and real timestamps, nothing may come of any of it — and
+    /// naming one of those authors as trusted must still wake the session.
+    #[test]
+    #[ignore = "reads a real public GitHub thread; run with CST_THREADS_LIVE=1"]
+    fn strangers_on_a_real_public_thread_wake_nothing_and_ask_nothing() {
+        if std::env::var_os("CST_THREADS_LIVE").is_none() {
+            return;
+        }
+        let thread = ThreadRef {
+            host: "github.com".to_string(),
+            owner: "rust-lang".to_string(),
+            repo: "rust".to_string(),
+            number: 100_000,
+            kind: ThreadKind::Issue,
+        };
+        let comments = fetch_comments(
+            &thread,
+            std::env::temp_dir(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("the fetch should succeed against a real thread");
+        let nobody_here = "cst-live-test-login-that-never-commented";
+        assert!(comments
+            .iter()
+            .all(|comment| !comment.author.eq_ignore_ascii_case(nobody_here)));
+        let joined_long_ago = |state: &mut ThreadState| {
+            state.subscribe("live-a", thread.clone());
+            state
+                .subscription_mut("live-a", &thread)
+                .unwrap()
+                .subscribed_at = DateTime::<Utc>::MIN_UTC;
+        };
+
+        let mut state = ThreadState::default();
+        joined_long_ago(&mut state);
+        let produced = plan(
+            &mut state,
+            &thread,
+            &comments,
+            nobody_here,
+            &[],
+            12,
+            Utc::now(),
+        );
+        assert!(!produced, "got: {:?}", recorded(&state));
+        assert!(state.notices.is_empty() && state.waiting_for_user().is_empty());
+
+        let colleague = comments
+            .last()
+            .expect("a thread with comments")
+            .author
+            .clone();
+        let mut state = ThreadState::default();
+        joined_long_ago(&mut state);
+        plan(
+            &mut state,
+            &thread,
+            &comments,
+            nobody_here,
+            std::slice::from_ref(&colleague),
+            12,
+            Utc::now(),
+        );
+        assert_eq!(
+            recorded(&state),
+            vec![Delivery::Wake {
+                session_id: "live-a".to_string(),
+                thread: thread.clone(),
+            }],
+            "trusting {colleague} must still let them in"
+        );
+        println!(
+            "{} real comments from strangers ignored; trusting {colleague} woke the session",
+            comments.len()
+        );
     }
 
     /// Three agents on one real thread: one posts, the other two hear it.
