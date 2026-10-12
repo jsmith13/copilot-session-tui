@@ -301,6 +301,17 @@ impl Drop for StateLock {
     }
 }
 
+/// When the state was last written, by anyone.
+///
+/// Every save replaces the file, so a changed time means somebody saved. That is how one
+/// CST learns that another planned a notice for a session only it has open: the poll
+/// cursors are shared as well, so its own watcher will never see that comment.
+pub fn modified_in(root: &Path) -> Option<std::time::SystemTime> {
+    fs::metadata(state_path(root))
+        .and_then(|metadata| metadata.modified())
+        .ok()
+}
+
 fn state_path(root: &Path) -> PathBuf {
     root.join("threads.json")
 }

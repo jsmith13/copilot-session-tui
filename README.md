@@ -767,6 +767,10 @@ A message for a session that is closed waits for you, because CST will not start
 session just because somebody commented. Those show up marked `@` in the session list
 with how long they have waited, and under **Waiting for you** in the command palette.
 
+With several CSTs open, any of them may see a reply first, and whichever one has the
+session open delivers it. A session that is open somewhere no CST can reach, such as a
+plain terminal, gets about five minutes before its message moves to **Waiting for you**.
+
 To work with a colleague's agent, name them:
 
 ```json

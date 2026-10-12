@@ -793,9 +793,13 @@ pub struct App {
     /// How many notices are still CST's to deal with rather than the user's.
     ///
     /// Only here so the idle tick can decide it has nothing to do without reading the
-    /// state file five times a minute forever. Safe to cache because the one writer
-    /// outside this thread — the watcher — says so on the mux channel.
+    /// state file five times a minute forever. Our own watcher announces what it writes,
+    /// but every other CST running on this machine writes the same file and tells us
+    /// nothing, so the cache is only trusted while `thread_state_seen` still matches.
     thread_live_notices: usize,
+
+    /// When the state file had last been written as of the cache above being filled.
+    thread_state_seen: Option<std::time::SystemTime>,
 
     /// The last reason the thread watcher gave for not working.
     ///
@@ -1002,6 +1006,7 @@ impl App {
             thread_inbox: None,
             thread_pending: Vec::new(),
             thread_live_notices: 0,
+            thread_state_seen: None,
             thread_watch_notice: None,
             restart_after_update: None,
             update_restart_requested: false,
@@ -4353,11 +4358,18 @@ impl App {
     ///
     /// Called on every idle tick as well as on events, because a pane holding an
     /// abandoned draft emits nothing at all. The counter is what keeps that affordable:
-    /// an install with no notices never touches the disk, and the only thing that can
-    /// add one behind CST's back — the watcher thread — announces itself.
+    /// an install with no notices costs one `stat` a pass, which is also how a notice
+    /// written by another CST is noticed — that one announces nothing to this process.
     pub fn flush_thread_wakes(&mut self) -> bool {
+        let discovered =
+            crate::threads::store::modified_in(&self.thread_state_root) != self.thread_state_seen;
+        if discovered {
+            // Reported as a change even if nothing here gets delivered: another CST may
+            // have put something in the inbox, and the badge should show it now.
+            self.refresh_thread_pending();
+        }
         if self.thread_live_notices == 0 {
-            return false;
+            return discovered;
         }
         let live: Vec<(String, crate::threads::ThreadRef, bool, i64)> =
             crate::threads::store::load_in(&self.thread_state_root)
@@ -4379,12 +4391,19 @@ impl App {
                 })
                 .collect();
         if live.is_empty() {
-            return false;
+            return discovered;
         }
 
         let mut changed = false;
         for (session_id, thread, sent, age) in live {
             if sent {
+                if self.pane_for_session(&session_id).is_none()
+                    && self.session_open_elsewhere(&session_id)
+                {
+                    // Another CST wrote it into its pane, and only that one can see when
+                    // the composer empties. Freeing the slot from here would be guessing.
+                    continue;
+                }
                 // Written into the composer already. It keeps holding this session's
                 // slot until the composer is empty again, which is the evidence that a
                 // turn actually took it — otherwise the next notice would be typed on
@@ -4396,6 +4415,14 @@ impl App {
                 continue;
             }
             if !self.has_running_pane_for(&session_id) {
+                if age < Self::WAKE_PATIENCE_SECS && self.session_open_elsewhere(&session_id) {
+                    // Every CST watches the same threads, so the one that saw this first
+                    // is often not the one hosting the session. Leave it for that one,
+                    // with the same patience a busy pane of our own would get: a session
+                    // open in a bare terminal has nobody to deliver to, and still has to
+                    // reach the user in the end.
+                    continue;
+                }
                 // Never start a session unasked. It becomes something the user can
                 // approve, with an age, so a stalled correspondence stays visible.
                 self.hold_thread_message(
@@ -4443,7 +4470,17 @@ impl App {
         if changed {
             self.refresh_thread_pending();
         }
-        changed
+        changed || discovered
+    }
+
+    /// Whether Copilot says a session is running, in some process other than our panes.
+    ///
+    /// Read from the session directory rather than `self.sessions`, which can predate a
+    /// session another CST started a minute ago.
+    fn session_open_elsewhere(&self, session_id: &str) -> bool {
+        crate::session::loader::session_is_active(
+            &self.copilot_home.join("session-state").join(session_id),
+        )
     }
 
     fn update_threads(&self, change: impl FnOnce(&mut crate::threads::store::ThreadState)) {
@@ -4512,6 +4549,9 @@ impl App {
 
     /// Re-read the notices from disk: what the user is asked about, and what is in hand.
     pub fn refresh_thread_pending(&mut self) {
+        // Timed before reading, so a save that lands in between reads as a change on the
+        // next pass instead of being taken as already seen.
+        self.thread_state_seen = crate::threads::store::modified_in(&self.thread_state_root);
         let notices = crate::threads::store::load_in(&self.thread_state_root).notices;
         self.thread_live_notices = notices
             .iter()

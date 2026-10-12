@@ -4099,6 +4099,139 @@ mod tests {
             .count()
     }
 
+    /// An instance that has not got the session open, while Copilot's own lock file says
+    /// it is running somewhere — in another CST, most likely. The lock names this test's
+    /// own process, which is as live as a pid gets.
+    fn bystander_to_open_session(home: &std::path::Path, id: &str) -> App {
+        let dir = home.join("session-state").join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("inuse.{}.lock", std::process::id())), "").unwrap();
+        let mut app = App::new(Vec::new(), crate::config::UserConfig::default());
+        app.mux = Some(crate::mux::MuxState::new(crate::mux::KeyChord {
+            code: KeyCode::Char('b'),
+            modifiers: KeyModifiers::CONTROL,
+        }));
+        app.copilot_home = home.to_path_buf();
+        app.thread_state_root = home.to_path_buf();
+        app
+    }
+
+    #[test]
+    fn an_instance_without_the_session_open_leaves_its_reply_for_the_one_that_has_it() {
+        // Every CST runs a watcher over the same threads.json, so the instance that
+        // happens to see a reply first is often not the one with the session open. It
+        // used to hold the reply as "its session is closed" on the spot, and the session
+        // that was open and waiting never heard of it.
+        let temp = tempfile::tempdir().unwrap();
+        let mut other = bystander_to_open_session(temp.path(), "session-a");
+
+        plan_and_apply(&mut other, "session-a", &test_thread(12));
+
+        assert_eq!(
+            count_with_status(&other, crate::threads::NoticeStatus::Planned),
+            1,
+            "got: {:?}",
+            notices_in(&other)
+        );
+        assert!(other.thread_pending.is_empty());
+    }
+
+    #[test]
+    fn a_reply_left_for_another_instance_still_reaches_the_user_if_nobody_delivers_it() {
+        // The session may be open in a bare terminal, or in a CST too old to look. Standing
+        // aside forever would lose the reply exactly the way the bug did.
+        let temp = tempfile::tempdir().unwrap();
+        let mut other = bystander_to_open_session(temp.path(), "session-a");
+        let thread = test_thread(12);
+        plan_and_apply(&mut other, "session-a", &thread);
+
+        crate::threads::store::update_in(temp.path(), |state| {
+            if let Some(notice) = state.notice_mut("session-a", &thread) {
+                notice.planned_at = chrono::Utc::now() - chrono::Duration::hours(1);
+            }
+        })
+        .unwrap();
+        other.flush_thread_wakes();
+
+        assert_eq!(
+            count_with_status(
+                &other,
+                crate::threads::NoticeStatus::Waiting {
+                    reason: crate::threads::PendingReason::SessionClosed
+                }
+            ),
+            1,
+            "got: {:?}",
+            notices_in(&other)
+        );
+    }
+
+    #[test]
+    fn an_instance_without_the_session_open_does_not_free_a_slot_another_one_is_holding() {
+        // Only the instance with the pane can see whether its composer has emptied. One
+        // that has no pane would count the composer as free and drop the marker, and the
+        // owner, which now reads the file, would lose its own bookkeeping.
+        let temp = tempfile::tempdir().unwrap();
+        let mut other = bystander_to_open_session(temp.path(), "session-a");
+        let thread = test_thread(12);
+        crate::threads::store::update_in(temp.path(), |state| {
+            state.record_notice(crate::threads::Notice {
+                session_id: "session-a".to_string(),
+                thread: thread.clone(),
+                comment_url: thread.url(),
+                author: None,
+                status: crate::threads::NoticeStatus::Sent,
+                planned_at: chrono::Utc::now(),
+            });
+        })
+        .unwrap();
+
+        other.flush_thread_wakes();
+
+        assert_eq!(
+            count_with_status(&other, crate::threads::NoticeStatus::Sent),
+            1,
+            "got: {:?}",
+            notices_in(&other)
+        );
+    }
+
+    #[test]
+    fn the_instance_with_the_session_open_delivers_a_reply_another_instance_planned() {
+        // The other half. The poll cursors are shared too, so once one instance has seen
+        // a comment, every other one is told by GitHub that nothing changed. The file is
+        // the only place the owner can learn about it.
+        let temp = tempfile::tempdir().unwrap();
+        let mut owner = App::new(Vec::new(), crate::config::UserConfig::default());
+        owner.mux = Some(crate::mux::MuxState::new(crate::mux::KeyChord {
+            code: KeyCode::Char('b'),
+            modifiers: KeyModifiers::CONTROL,
+        }));
+        push_test_pane_at(&mut owner, 1, "session-a", temp.path().to_path_buf());
+        owner.thread_state_root = temp.path().to_path_buf();
+        owner.refresh_thread_pending();
+
+        // Written by another process; this one was never told.
+        let thread = test_thread(12);
+        crate::threads::store::update_in(temp.path(), |state| {
+            state.record_notice(crate::threads::Notice {
+                session_id: "session-a".to_string(),
+                thread: thread.clone(),
+                comment_url: thread.url(),
+                author: None,
+                status: crate::threads::NoticeStatus::Planned,
+                planned_at: chrono::Utc::now(),
+            });
+        })
+        .unwrap();
+
+        assert!(owner.flush_thread_wakes(), "got: {:?}", notices_in(&owner));
+        assert_eq!(
+            count_with_status(&owner, crate::threads::NoticeStatus::Sent),
+            1
+        );
+    }
+
     /// The reported bug, end to end: typing, a wake-up arriving, and what happens next.
     ///
     /// Deliberately driven through `handle_attached_event` rather than by calling the
