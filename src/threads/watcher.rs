@@ -1137,6 +1137,164 @@ mod tests {
         println!("survived a restart pointing at {}", survivor.comment_url);
     }
 
+    /// The reported failure, reproduced against real GitHub.
+    ///
+    /// A notice held days earlier as "its session is closed" sat on the thread, and the
+    /// replies that arrived after it were folded into it and never delivered. Offline
+    /// tests cover `record_notice`; this one proves the whole path from a comment GitHub
+    /// really issued to a notice queued for delivery again, with a clock young enough
+    /// that the patience deadline does not hold it straight back.
+    ///
+    /// Posts a real comment on the configured thread each time it runs.
+    #[test]
+    #[ignore = "posts to a real GitHub issue; run with CST_THREADS_ROUNDTRIP=<issue url>"]
+    fn a_real_reply_puts_a_notice_held_days_ago_back_in_the_queue() {
+        let Ok(url) = std::env::var("CST_THREADS_ROUNDTRIP") else {
+            return;
+        };
+        let thread = super::super::parse_thread_url(&url).expect("a thread URL");
+        let root = tempfile::tempdir().unwrap();
+        let login = doorbell::current_login(&thread.host).expect("gh must be logged in");
+        let token = doorbell::token_for(&thread.host).expect("gh must have a token");
+        let transport = UreqTransport::new();
+        let held_at = Utc::now() - chrono::Duration::days(3);
+
+        store::update_in(root.path(), |state| {
+            state.subscribe("live-a", thread.clone());
+            state.record_notice(Notice {
+                session_id: "live-a".to_string(),
+                thread: thread.clone(),
+                comment_url: format!("{}#issuecomment-1", thread.url()),
+                author: Some(login.clone()),
+                status: NoticeStatus::Waiting {
+                    reason: PendingReason::SessionClosed,
+                },
+                planned_at: held_at,
+            });
+        })
+        .unwrap();
+        thread_moved(&transport, root.path(), &thread, &token).unwrap();
+
+        let report = super::super::cli::post(
+            root.path(),
+            "live-b",
+            &url,
+            &format!(
+                "Held-notice check at {}. A reply after a notice was held three days ago.",
+                Utc::now().to_rfc3339()
+            ),
+        )
+        .expect("posting should succeed");
+        let posted_url = report.lines().nth(1).expect("the report names the comment");
+
+        assert!(thread_moved(&transport, root.path(), &thread, &token).unwrap());
+        let comments = fetch_comments(
+            &thread,
+            root.path().to_path_buf(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("fetching comments should succeed");
+        store::update_in(root.path(), |state| {
+            plan(state, &thread, &comments, &login, &[], 12, Utc::now())
+        })
+        .unwrap();
+
+        let state = store::load_in(root.path());
+        let notice = state
+            .notices
+            .iter()
+            .find(|notice| notice.session_id == "live-a")
+            .expect("still one notice for the thread");
+        assert_eq!(notice.status, NoticeStatus::Planned, "got: {notice:?}");
+        assert!(notice.planned_at > held_at, "the clock must restart");
+        assert_eq!(notice.comment_url, posted_url);
+        assert!(state.waiting_for_user().is_empty());
+        println!("held notice re-queued, pointing at {}", notice.comment_url);
+    }
+
+    /// Strangers' comments on a real public thread, run through the rules.
+    ///
+    /// Read-only. Pretends a session joined the thread long ago, so every comment on it
+    /// counts as new, and that we are a login that never commented there. With real
+    /// authors, real ids and real timestamps, nothing may come of any of it — and
+    /// naming one of those authors as trusted must still wake the session.
+    #[test]
+    #[ignore = "reads a real public GitHub thread; run with CST_THREADS_LIVE=1"]
+    fn strangers_on_a_real_public_thread_wake_nothing_and_ask_nothing() {
+        if std::env::var_os("CST_THREADS_LIVE").is_none() {
+            return;
+        }
+        let thread = ThreadRef {
+            host: "github.com".to_string(),
+            owner: "rust-lang".to_string(),
+            repo: "rust".to_string(),
+            number: 100_000,
+            kind: ThreadKind::Issue,
+        };
+        let comments = fetch_comments(
+            &thread,
+            std::env::temp_dir(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("the fetch should succeed against a real thread");
+        let nobody_here = "cst-live-test-login-that-never-commented";
+        assert!(comments
+            .iter()
+            .all(|comment| !comment.author.eq_ignore_ascii_case(nobody_here)));
+        let joined_long_ago = |state: &mut ThreadState| {
+            state.subscribe("live-a", thread.clone());
+            state
+                .subscription_mut("live-a", &thread)
+                .unwrap()
+                .subscribed_at = DateTime::<Utc>::MIN_UTC;
+        };
+
+        let mut state = ThreadState::default();
+        joined_long_ago(&mut state);
+        let produced = plan(
+            &mut state,
+            &thread,
+            &comments,
+            nobody_here,
+            &[],
+            12,
+            Utc::now(),
+        );
+        assert!(!produced, "got: {:?}", recorded(&state));
+        assert!(state.notices.is_empty() && state.waiting_for_user().is_empty());
+
+        let colleague = comments
+            .last()
+            .expect("a thread with comments")
+            .author
+            .clone();
+        let mut state = ThreadState::default();
+        joined_long_ago(&mut state);
+        plan(
+            &mut state,
+            &thread,
+            &comments,
+            nobody_here,
+            std::slice::from_ref(&colleague),
+            12,
+            Utc::now(),
+        );
+        assert_eq!(
+            recorded(&state),
+            vec![Delivery::Wake {
+                session_id: "live-a".to_string(),
+                thread: thread.clone(),
+            }],
+            "trusting {colleague} must still let them in"
+        );
+        println!(
+            "{} real comments from strangers ignored; trusting {colleague} woke the session",
+            comments.len()
+        );
+    }
+
     /// Three agents on one real thread: one posts, the other two hear it.
     ///
     /// The offline test covers the same rule, but not what happens when three
