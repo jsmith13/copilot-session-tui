@@ -4215,6 +4215,71 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_thread_reply_waits_for_a_long_running_turn_and_arrives_when_it_finishes() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Vec::new(), crate::config::UserConfig::default());
+        app.mux = Some(crate::mux::MuxState::new(crate::mux::KeyChord {
+            code: KeyCode::Char('b'),
+            modifiers: KeyModifiers::CONTROL,
+        }));
+        push_test_pane_at(&mut app, 1, "session-a", temp.path().to_path_buf());
+        app.view = crate::app::View::Attached(1);
+        app.thread_state_root = temp.path().to_path_buf();
+
+        app.mux.as_mut().unwrap().pane_mut(1).unwrap().apply_hook(
+            crate::events::hooks::HookLifecycleEvent::Working { timestamp: 1 },
+            false,
+        );
+
+        let thread = test_thread(12);
+        plan_and_apply(&mut app, "session-a", &thread);
+        crate::threads::store::update_in(&app.thread_state_root, |state| {
+            state
+                .notice_mut("session-a", &thread)
+                .expect("the reply is queued")
+                .planned_at = chrono::Utc::now() - chrono::Duration::minutes(37);
+        })
+        .expect("backdating the reply");
+
+        app.flush_thread_wakes();
+        assert_eq!(
+            count_with_status(&app, crate::threads::NoticeStatus::Planned),
+            1,
+            "a long working turn must not strand a reply as a closed-session notice"
+        );
+        assert!(app.thread_pending.is_empty());
+        assert!(
+            !app.mux.as_ref().unwrap().pane(1).unwrap().has_draft(),
+            "the reply must not be injected while the turn is working"
+        );
+
+        {
+            let pane = app.mux.as_mut().unwrap().pane_mut(1).unwrap();
+            pane.apply_hook(
+                crate::events::hooks::HookLifecycleEvent::Ready { timestamp: 2 },
+                false,
+            );
+            pane.confirm_hook_ready(2, false);
+        }
+        assert!(
+            app.flush_thread_wakes(),
+            "finishing the turn delivers the reply"
+        );
+        assert_eq!(
+            count_with_status(&app, crate::threads::NoticeStatus::Sent),
+            1
+        );
+        assert_eq!(
+            count_with_status(&app, crate::threads::NoticeStatus::Planned),
+            0
+        );
+        assert!(
+            !app.flush_thread_wakes(),
+            "an unread reply must not be delivered twice"
+        );
+    }
+
     /// A notice planned by one run is still delivered by the next.
     ///
     /// This is why the status lives on disk rather than in memory. The comment behind a

@@ -767,6 +767,11 @@ A message for a session that is closed waits for you, because CST will not start
 session just because somebody commented. Those show up marked `@` in the session list
 with how long they have waited, and under **Waiting for you** in the command palette.
 
+Replies to a working session stay queued until its current turn finishes, even when that
+turn takes longer than five minutes. CST never injects them into a working turn or an
+unsent draft. An unattended draft or user-action prompt still sends a notice to **Waiting
+for you** after it has waited five minutes.
+
 To work with a colleague's agent, name them:
 
 ```json

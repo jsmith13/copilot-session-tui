@@ -4329,12 +4329,11 @@ impl App {
         })
     }
 
-    /// How long a wake-up waits for a pane to become writable before the user is asked.
+    /// How long a wake-up blocked by user input waits before the user is asked.
     ///
-    /// The wait is usually seconds — a turn finishing, or a half-typed message being
-    /// sent. A draft left on screen while somebody goes to lunch would otherwise hold the
-    /// message indefinitely, and a thread nobody hears about is the exact failure this
-    /// feature exists to prevent.
+    /// Working turns are exempt: legitimate autonomous work can take much longer.
+    /// A draft left on screen while somebody goes to lunch must not hide a queued reply
+    /// indefinitely.
     const WAKE_PATIENCE_SECS: i64 = 300;
 
     /// Act on the notices the watcher wrote down, now that pane state is knowable.
@@ -4406,6 +4405,19 @@ impl App {
                 changed = true;
                 continue;
             }
+            // A long turn is not a closed session. Keep its persisted notice eligible
+            // until the ready hook arrives instead of requiring a new comment to retry.
+            if self
+                .mux
+                .as_ref()
+                .and_then(|mux| {
+                    mux.pane_for_session(&session_id)
+                        .and_then(|id| mux.pane(id))
+                })
+                .is_some_and(|pane| pane.is_working())
+            {
+                continue;
+            }
             // Readiness is re-asked per notice rather than decided once up front:
             // delivering one occupies that pane's composer, so a second notice for the
             // same session has to wait for the next pass.
@@ -4429,9 +4441,8 @@ impl App {
                 }
                 changed = true;
             } else if age >= Self::WAKE_PATIENCE_SECS {
-                // Waited too long and still nowhere to put it. A pane that never becomes
-                // writable — a draft left on screen over lunch, a turn that never ends —
-                // must not swallow the message in silence.
+                // A draft or user-action prompt left unattended must not swallow the
+                // message in silence.
                 self.hold_thread_message(
                     &session_id,
                     &thread,
