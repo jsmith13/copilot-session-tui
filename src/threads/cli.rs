@@ -78,7 +78,7 @@ pub fn post(root: &Path, session_id: &str, url: &str, body: &str) -> Result<Stri
             number: thread.number,
             discussion: thread.kind == ThreadKind::Discussion,
         },
-        body,
+        &with_footer(body, session_id),
         cancelled,
     )
     .map_err(|error| anyhow::anyhow!("{error}"))?;
@@ -88,6 +88,24 @@ pub fn post(root: &Path, session_id: &str, url: &str, body: &str) -> Result<Stri
     // else's comment that later happens to share the id.
     remember_own_comment(root, session_id, &thread, &posted.id)?;
     Ok(render_post(&thread, session_id, &posted.url))
+}
+
+/// Sign a comment with the session that wrote it.
+///
+/// Every CST agent posts as the user's own account, so on GitHub an agent's comment
+/// and one the user typed in a browser look identical, and two agents in one thread
+/// cannot be told apart. The full id rather than the short one, because it is what
+/// `--session` takes and what finds the session again.
+///
+/// For people reading the thread only. CST never reads it back: anybody can type this
+/// line into a comment, and the login is what decides who is trusted.
+fn with_footer(body: &str, session_id: &str) -> String {
+    // A blank line first. Without it the footer joins the last paragraph, and a line
+    // of dashes as a separator would turn that paragraph into a heading instead.
+    format!(
+        "{}\n\n<sub>Posted by CST from session `{session_id}`</sub>",
+        body.trim_end()
+    )
 }
 
 fn render_post(thread: &ThreadRef, session_id: &str, comment_url: &str) -> String {
@@ -350,6 +368,32 @@ mod tests {
         assert!(read_body(Some("   "), None).is_err());
         assert!(read_body(None, None).is_err());
         assert!(read_body(Some("x"), Some("y")).is_err());
+    }
+
+    #[test]
+    fn a_posted_comment_names_the_full_session_so_a_reader_can_tell_agents_from_the_user() {
+        let session = "d6a86c02-d466-4f34-af86-db04c324d06c";
+
+        let posted = with_footer("Here is the answer.\n\n", session);
+
+        assert!(
+            posted.starts_with("Here is the answer.\n\n<sub>"),
+            "got: {posted:?}"
+        );
+        assert!(posted.contains(&format!("`{session}`")), "got: {posted:?}");
+        assert!(posted.contains("CST"), "got: {posted:?}");
+    }
+
+    #[test]
+    fn the_footer_is_its_own_paragraph_so_it_cannot_restyle_the_last_line_of_the_body() {
+        // Glued to the last line it would render as part of that paragraph, and a
+        // trailing list item or table row would swallow it outright.
+        let posted = with_footer("- one\n- two", "session-a");
+
+        let (body, footer) = posted.rsplit_once("\n\n").unwrap();
+        assert_eq!(body, "- one\n- two");
+        assert!(footer.starts_with("<sub>") && footer.ends_with("</sub>"));
+        assert!(!footer.contains('\n'), "got: {footer:?}");
     }
 
     #[test]

@@ -727,6 +727,12 @@ A session that takes part in a GitHub issue, pull request, or discussion is subs
 it. When somebody comments, CST hands that session a link and lets it pick the work back
 up. Agents run these commands themselves; you should not need to.
 
+Agents post as your GitHub account, so a comment posted through CST ends with a small
+line naming the session that wrote it. That is how you, or anyone reading the thread,
+tell an agent's comment from one you typed yourself, and one agent from another. It is
+there for readers only: CST never reads it back, and who may wake a session is still
+decided by login alone.
+
 ```bash
 copilot-session-tui thread post <url> --body-file -   # comment, and start watching
 copilot-session-tui thread watch <url>                # watch without posting
