@@ -767,6 +767,11 @@ A message for a session that is closed waits for you, because CST will not start
 session just because somebody commented. Those show up marked `@` in the session list
 with how long they have waited, and under **Waiting for you** in the command palette.
 
+Replies to a working session stay queued until its current turn finishes, even when that
+turn takes longer than five minutes. CST never injects them into a working turn or an
+unsent draft. If the turn ends on a question for you, or with a draft left in the
+composer, the reply waits about five more minutes and then moves to **Waiting for you**.
+
 With several CSTs open, any of them may see a reply first, and whichever one has the
 session open delivers it. A session that is open somewhere no CST can reach, such as a
 plain terminal, gets about five minutes before its message moves to **Waiting for you**.

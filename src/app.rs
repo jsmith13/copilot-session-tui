@@ -4334,13 +4334,17 @@ impl App {
         })
     }
 
-    /// How long a wake-up waits for a pane to become writable before the user is asked.
+    /// How long a wake-up blocked by user input waits before the user is asked.
     ///
-    /// The wait is usually seconds — a turn finishing, or a half-typed message being
-    /// sent. A draft left on screen while somebody goes to lunch would otherwise hold the
-    /// message indefinitely, and a thread nobody hears about is the exact failure this
-    /// feature exists to prevent.
+    /// Working turns are exempt: legitimate autonomous work can take much longer.
+    /// A draft left on screen while somebody goes to lunch must not hide a queued reply
+    /// indefinitely.
     const WAKE_PATIENCE_SECS: i64 = 300;
+
+    /// How stale a waiting notice's clock may get while its pane works before it is
+    /// restarted. Restarting on every pass would rewrite `threads.json` several times a
+    /// second for the length of the turn; this costs at most a minute of patience.
+    const WORKING_CLOCK_SLACK_SECS: i64 = 60;
 
     /// Act on the notices the watcher wrote down, now that pane state is knowable.
     ///
@@ -4433,6 +4437,33 @@ impl App {
                 changed = true;
                 continue;
             }
+            // A long turn is not a closed session. Keep its persisted notice eligible
+            // until the ready hook arrives instead of requiring a new comment to retry.
+            //
+            // The clock restarts while it waits, so patience is measured from the end
+            // of the turn. Otherwise a turn that ends on a question for the user, or
+            // with a draft in the composer, would hold the notice at once instead of
+            // after the usual five minutes. The cost is that a turn which never ends
+            // keeps the notice queued for as long as it runs; the session list already
+            // shows that session as working, which is where somebody would look.
+            if self
+                .mux
+                .as_ref()
+                .and_then(|mux| {
+                    mux.pane_for_session(&session_id)
+                        .and_then(|id| mux.pane(id))
+                })
+                .is_some_and(|pane| pane.is_working())
+            {
+                if age >= Self::WORKING_CLOCK_SLACK_SECS {
+                    self.update_threads(|state| {
+                        if let Some(notice) = state.notice_mut(&session_id, &thread) {
+                            notice.planned_at = chrono::Utc::now();
+                        }
+                    });
+                }
+                continue;
+            }
             // Readiness is re-asked per notice rather than decided once up front:
             // delivering one occupies that pane's composer, so a second notice for the
             // same session has to wait for the next pass.
@@ -4456,9 +4487,8 @@ impl App {
                 }
                 changed = true;
             } else if age >= Self::WAKE_PATIENCE_SECS {
-                // Waited too long and still nowhere to put it. A pane that never becomes
-                // writable — a draft left on screen over lunch, a turn that never ends —
-                // must not swallow the message in silence.
+                // A draft or user-action prompt left unattended must not swallow the
+                // message in silence.
                 self.hold_thread_message(
                     &session_id,
                     &thread,
