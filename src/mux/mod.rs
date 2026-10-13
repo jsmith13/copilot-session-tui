@@ -306,12 +306,15 @@ pub fn resolve_help_command(key: &KeyEvent) -> Option<HelpCommand> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GithubCommand {
     Inspect,
+    /// The thread messages waiting on the user.
+    Messages,
     Cancel,
 }
 
 pub fn resolve_github_command(key: &KeyEvent) -> Option<GithubCommand> {
     match key.code {
         KeyCode::Char('i') => Some(GithubCommand::Inspect),
+        KeyCode::Char('m') => Some(GithubCommand::Messages),
         KeyCode::Esc => Some(GithubCommand::Cancel),
         _ => None,
     }
@@ -1450,10 +1453,14 @@ mod tests {
     }
 
     #[test]
-    fn github_commands_map_to_inspection() {
+    fn github_commands_map_to_inspection_and_waiting_messages() {
         assert_eq!(
             resolve_github_command(&key(KeyCode::Char('i'), KeyModifiers::NONE)),
             Some(GithubCommand::Inspect)
+        );
+        assert_eq!(
+            resolve_github_command(&key(KeyCode::Char('m'), KeyModifiers::NONE)),
+            Some(GithubCommand::Messages)
         );
         assert_eq!(
             resolve_github_command(&key(KeyCode::Esc, KeyModifiers::NONE)),

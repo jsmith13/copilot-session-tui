@@ -530,7 +530,7 @@ pub fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         ],
         PaneStatus::Running if mux.prefix_state == PrefixState::Github => vec![
             Span::styled(" GitHub ", badge_style(theme, theme.accent)),
-            Span::raw(" i inspect  Esc cancel "),
+            Span::raw(" i inspect  m messages  Esc cancel "),
         ],
         PaneStatus::Running if mux.prefix_state == PrefixState::Layout => vec![
             Span::styled(" Layout ", badge_style(theme, theme.accent_alt)),

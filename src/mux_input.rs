@@ -938,8 +938,10 @@ fn handle_attached_key(app: &mut App, key: KeyEvent) {
         if let Some(mux) = app.mux.as_mut() {
             mux.prefix_state = PrefixState::Idle;
         }
-        if matches!(resolve_github_command(&key), Some(GithubCommand::Inspect)) {
-            app.open_github_inspector();
+        match resolve_github_command(&key) {
+            Some(GithubCommand::Inspect) => app.open_github_inspector(),
+            Some(GithubCommand::Messages) => app.open_thread_inbox(),
+            _ => {}
         }
         return;
     }
@@ -2169,9 +2171,15 @@ pub fn handle_list_prefix(app: &mut App, key: KeyEvent) -> bool {
         if let Some(mux) = app.mux.as_mut() {
             mux.prefix_state = PrefixState::Idle;
         }
-        if matches!(resolve_github_command(&key), Some(GithubCommand::Inspect)) {
-            app.status_message =
-                Some("Attach to a session before inspecting a GitHub item".to_string());
+        match resolve_github_command(&key) {
+            Some(GithubCommand::Inspect) => {
+                app.status_message =
+                    Some("Attach to a session before inspecting a GitHub item".to_string());
+            }
+            // Unlike inspecting, this is about every session, so the list is a natural
+            // place to ask from.
+            Some(GithubCommand::Messages) => app.open_thread_inbox(),
+            _ => {}
         }
         return true;
     }
@@ -5210,6 +5218,33 @@ mod tests {
             app.status_message.as_deref(),
             Some("Attach to a session before inspecting a GitHub item")
         );
+    }
+
+    #[test]
+    fn waiting_thread_messages_open_from_a_key_on_the_list_and_inside_a_session() {
+        // Command search was the only way in, which meant knowing the inbox existed and
+        // what it was called. It concerns every session, so it works from both places.
+        let mut app = mux_app();
+        app.view = View::List;
+        for key in [
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+        ] {
+            assert!(handle_list_prefix(&mut app, key));
+        }
+        assert_eq!(app.thread_inbox, Some(0));
+
+        let mut app = attached_mux_app("thread-inbox-key-test");
+        for key in [
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+        ] {
+            handle_attached_key(&mut app, key);
+        }
+        assert_eq!(app.thread_inbox, Some(0));
+        let _ = app.mux.as_mut().unwrap().shutdown();
     }
 
     #[test]

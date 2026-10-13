@@ -577,9 +577,10 @@ fn commands(app: &App) -> Vec<CommandEntry> {
             Group::GitHub,
             "Waiting for you",
             "GitHub thread messages held for your approval",
+            "C-b g m",
+            // Opens even when empty, like the key: "Nothing is waiting" is an answer.
+            true,
             "",
-            !app.thread_pending.is_empty(),
-            "Nothing is waiting",
         ),
         entry(
             Id::WhatsNew,
