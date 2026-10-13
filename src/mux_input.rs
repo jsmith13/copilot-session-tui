@@ -938,8 +938,10 @@ fn handle_attached_key(app: &mut App, key: KeyEvent) {
         if let Some(mux) = app.mux.as_mut() {
             mux.prefix_state = PrefixState::Idle;
         }
-        if matches!(resolve_github_command(&key), Some(GithubCommand::Inspect)) {
-            app.open_github_inspector();
+        match resolve_github_command(&key) {
+            Some(GithubCommand::Inspect) => app.open_github_inspector(),
+            Some(GithubCommand::Messages) => app.open_thread_inbox(),
+            _ => {}
         }
         return;
     }
@@ -2169,9 +2171,15 @@ pub fn handle_list_prefix(app: &mut App, key: KeyEvent) -> bool {
         if let Some(mux) = app.mux.as_mut() {
             mux.prefix_state = PrefixState::Idle;
         }
-        if matches!(resolve_github_command(&key), Some(GithubCommand::Inspect)) {
-            app.status_message =
-                Some("Attach to a session before inspecting a GitHub item".to_string());
+        match resolve_github_command(&key) {
+            Some(GithubCommand::Inspect) => {
+                app.status_message =
+                    Some("Attach to a session before inspecting a GitHub item".to_string());
+            }
+            // Unlike inspecting, this is about every session, so the list is a natural
+            // place to ask from.
+            Some(GithubCommand::Messages) => app.open_thread_inbox(),
+            _ => {}
         }
         return true;
     }
@@ -4099,6 +4107,223 @@ mod tests {
             .count()
     }
 
+    /// An instance that has not got the session open, while Copilot's own lock file says
+    /// it is running somewhere — in another CST, most likely. The lock names this test's
+    /// own process, which is as live as a pid gets.
+    fn bystander_to_open_session(home: &std::path::Path, id: &str) -> App {
+        let dir = home.join("session-state").join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("inuse.{}.lock", std::process::id())), "").unwrap();
+        let mut app = App::new(Vec::new(), crate::config::UserConfig::default());
+        app.mux = Some(crate::mux::MuxState::new(crate::mux::KeyChord {
+            code: KeyCode::Char('b'),
+            modifiers: KeyModifiers::CONTROL,
+        }));
+        app.copilot_home = home.to_path_buf();
+        app.thread_state_root = home.to_path_buf();
+        app
+    }
+
+    #[test]
+    fn an_instance_without_the_session_open_leaves_its_reply_for_the_one_that_has_it() {
+        // Every CST runs a watcher over the same threads.json, so the instance that
+        // happens to see a reply first is often not the one with the session open. It
+        // used to hold the reply as "its session is closed" on the spot, and the session
+        // that was open and waiting never heard of it.
+        let temp = tempfile::tempdir().unwrap();
+        let mut other = bystander_to_open_session(temp.path(), "session-a");
+
+        plan_and_apply(&mut other, "session-a", &test_thread(12));
+
+        assert_eq!(
+            count_with_status(&other, crate::threads::NoticeStatus::Planned),
+            1,
+            "got: {:?}",
+            notices_in(&other)
+        );
+        assert!(other.thread_pending.is_empty());
+    }
+
+    #[test]
+    fn a_tab_another_instance_opened_but_has_not_used_yet_still_counts_as_open() {
+        // Copilot only takes its lock once a session runs a turn, so right after a CST
+        // restarts, every tab it resumed looks closed by that measure. Found in the
+        // end-to-end run: the other instance's workspace record is what still shows it.
+        let temp = tempfile::tempdir().unwrap();
+        let mut other = App::new(Vec::new(), crate::config::UserConfig::default());
+        other.mux = Some(crate::mux::MuxState::new(crate::mux::KeyChord {
+            code: KeyCode::Char('b'),
+            modifiers: KeyModifiers::CONTROL,
+        }));
+        other.copilot_home = temp.path().to_path_buf();
+        other.thread_state_root = temp.path().to_path_buf();
+        let records = temp.path().join("workspaces");
+        other.workspace_record_root = Some(records.clone());
+        // Another instance: this test's pid stands in for a running process, and a
+        // different start time makes it somebody else's record.
+        crate::recovery::write_in(
+            &records,
+            &crate::recovery::WorkspaceRecord {
+                pid: std::process::id(),
+                started_at: other.instance_started_at - chrono::Duration::minutes(5),
+                saved_at: chrono::Utc::now(),
+                launch_dir: None,
+                sessions: vec![crate::recovery::RecordedSession {
+                    session_id: "session-a".to_string(),
+                    cwd: temp.path().display().to_string(),
+                    title: "session-a".to_string(),
+                }],
+                focused_session_id: None,
+                windows: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        plan_and_apply(&mut other, "session-a", &test_thread(12));
+
+        assert_eq!(
+            count_with_status(&other, crate::threads::NoticeStatus::Planned),
+            1,
+            "got: {:?}",
+            notices_in(&other)
+        );
+    }
+
+    #[test]
+    fn a_reply_left_for_another_instance_still_reaches_the_user_if_nobody_delivers_it() {
+        // The session may be open in a bare terminal, or in a CST too old to look. Standing
+        // aside forever would lose the reply exactly the way the bug did.
+        let temp = tempfile::tempdir().unwrap();
+        let mut other = bystander_to_open_session(temp.path(), "session-a");
+        let thread = test_thread(12);
+        plan_and_apply(&mut other, "session-a", &thread);
+
+        crate::threads::store::update_in(temp.path(), |state| {
+            if let Some(notice) = state.notice_mut("session-a", &thread) {
+                notice.planned_at = chrono::Utc::now() - chrono::Duration::hours(1);
+            }
+        })
+        .unwrap();
+        other.flush_thread_wakes();
+
+        assert_eq!(
+            count_with_status(
+                &other,
+                crate::threads::NoticeStatus::Waiting {
+                    reason: crate::threads::PendingReason::SessionClosed
+                }
+            ),
+            1,
+            "got: {:?}",
+            notices_in(&other)
+        );
+    }
+
+    #[test]
+    fn an_instance_without_the_session_open_does_not_free_a_slot_another_one_is_holding() {
+        // Only the instance with the pane can see whether its composer has emptied. One
+        // that has no pane would count the composer as free and drop the marker, and the
+        // owner, which now reads the file, would lose its own bookkeeping.
+        let temp = tempfile::tempdir().unwrap();
+        let mut other = bystander_to_open_session(temp.path(), "session-a");
+        let thread = test_thread(12);
+        crate::threads::store::update_in(temp.path(), |state| {
+            state.record_notice(crate::threads::Notice {
+                session_id: "session-a".to_string(),
+                thread: thread.clone(),
+                comment_url: thread.url(),
+                author: None,
+                status: crate::threads::NoticeStatus::Sent,
+                planned_at: chrono::Utc::now(),
+            });
+        })
+        .unwrap();
+
+        other.flush_thread_wakes();
+
+        assert_eq!(
+            count_with_status(&other, crate::threads::NoticeStatus::Sent),
+            1,
+            "got: {:?}",
+            notices_in(&other)
+        );
+    }
+
+    #[test]
+    fn a_reply_left_unread_in_a_composer_that_closed_reaches_the_inbox_instead_of_vanishing() {
+        // The CST that typed the link quit, or its tab was closed, before any turn took
+        // it. Every other CST now reads the file and would count a composer it never had
+        // as empty, which used to drop the reply without a word to anyone.
+        let temp = tempfile::tempdir().unwrap();
+        let mut other = App::new(Vec::new(), crate::config::UserConfig::default());
+        other.mux = Some(crate::mux::MuxState::new(crate::mux::KeyChord {
+            code: KeyCode::Char('b'),
+            modifiers: KeyModifiers::CONTROL,
+        }));
+        other.copilot_home = temp.path().to_path_buf();
+        other.thread_state_root = temp.path().to_path_buf();
+        let thread = test_thread(12);
+        crate::threads::store::update_in(temp.path(), |state| {
+            state.record_notice(crate::threads::Notice {
+                session_id: "session-a".to_string(),
+                thread: thread.clone(),
+                comment_url: thread.url(),
+                author: None,
+                status: crate::threads::NoticeStatus::Sent,
+                planned_at: chrono::Utc::now(),
+            });
+        })
+        .unwrap();
+
+        other.flush_thread_wakes();
+        other.flush_thread_wakes();
+
+        assert_eq!(
+            other
+                .thread_pending_for("session-a")
+                .and_then(crate::threads::Notice::reason),
+            Some(crate::threads::PendingReason::SessionClosed),
+            "got: {:?}",
+            notices_in(&other)
+        );
+    }
+
+    #[test]
+    fn the_instance_with_the_session_open_delivers_a_reply_another_instance_planned() {
+        // The other half. The poll cursors are shared too, so once one instance has seen
+        // a comment, every other one is told by GitHub that nothing changed. The file is
+        // the only place the owner can learn about it.
+        let temp = tempfile::tempdir().unwrap();
+        let mut owner = App::new(Vec::new(), crate::config::UserConfig::default());
+        owner.mux = Some(crate::mux::MuxState::new(crate::mux::KeyChord {
+            code: KeyCode::Char('b'),
+            modifiers: KeyModifiers::CONTROL,
+        }));
+        push_test_pane_at(&mut owner, 1, "session-a", temp.path().to_path_buf());
+        owner.thread_state_root = temp.path().to_path_buf();
+        owner.refresh_thread_pending();
+
+        // Written by another process; this one was never told.
+        let thread = test_thread(12);
+        crate::threads::store::update_in(temp.path(), |state| {
+            state.record_notice(crate::threads::Notice {
+                session_id: "session-a".to_string(),
+                thread: thread.clone(),
+                comment_url: thread.url(),
+                author: None,
+                status: crate::threads::NoticeStatus::Planned,
+                planned_at: chrono::Utc::now(),
+            });
+        })
+        .unwrap();
+
+        assert!(owner.flush_thread_wakes(), "got: {:?}", notices_in(&owner));
+        assert_eq!(
+            count_with_status(&owner, crate::threads::NoticeStatus::Sent),
+            1
+        );
+    }
+
     /// The reported bug, end to end: typing, a wake-up arriving, and what happens next.
     ///
     /// Deliberately driven through `handle_attached_event` rather than by calling the
@@ -4215,6 +4440,125 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_thread_reply_waits_for_a_long_running_turn_and_arrives_when_it_finishes() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Vec::new(), crate::config::UserConfig::default());
+        app.mux = Some(crate::mux::MuxState::new(crate::mux::KeyChord {
+            code: KeyCode::Char('b'),
+            modifiers: KeyModifiers::CONTROL,
+        }));
+        push_test_pane_at(&mut app, 1, "session-a", temp.path().to_path_buf());
+        app.view = crate::app::View::Attached(1);
+        app.thread_state_root = temp.path().to_path_buf();
+
+        app.mux.as_mut().unwrap().pane_mut(1).unwrap().apply_hook(
+            crate::events::hooks::HookLifecycleEvent::Working { timestamp: 1 },
+            false,
+        );
+
+        let thread = test_thread(12);
+        plan_and_apply(&mut app, "session-a", &thread);
+        crate::threads::store::update_in(&app.thread_state_root, |state| {
+            state
+                .notice_mut("session-a", &thread)
+                .expect("the reply is queued")
+                .planned_at = chrono::Utc::now() - chrono::Duration::minutes(37);
+        })
+        .expect("backdating the reply");
+
+        app.flush_thread_wakes();
+        assert_eq!(
+            count_with_status(&app, crate::threads::NoticeStatus::Planned),
+            1,
+            "a long working turn must not strand a reply as a closed-session notice"
+        );
+        assert!(app.thread_pending.is_empty());
+        assert!(
+            !app.mux.as_ref().unwrap().pane(1).unwrap().has_draft(),
+            "the reply must not be injected while the turn is working"
+        );
+
+        {
+            let pane = app.mux.as_mut().unwrap().pane_mut(1).unwrap();
+            pane.apply_hook(
+                crate::events::hooks::HookLifecycleEvent::Ready { timestamp: 2 },
+                false,
+            );
+            pane.confirm_hook_ready(2, false);
+        }
+        assert!(
+            app.flush_thread_wakes(),
+            "finishing the turn delivers the reply"
+        );
+        assert_eq!(
+            count_with_status(&app, crate::threads::NoticeStatus::Sent),
+            1
+        );
+        assert_eq!(
+            count_with_status(&app, crate::threads::NoticeStatus::Planned),
+            0
+        );
+        assert!(
+            !app.flush_thread_wakes(),
+            "an unread reply must not be delivered twice"
+        );
+    }
+
+    #[test]
+    fn a_long_turn_that_ends_with_a_draft_still_gives_the_reply_the_full_five_minutes() {
+        // Patience exists for a pane blocked by the user, so it has to be measured from
+        // when the user became the obstacle. Counted from when the reply arrived, a
+        // 37-minute turn would leave it overdue the moment the turn ended, and a draft
+        // typed in the meantime would send it straight to the inbox.
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Vec::new(), crate::config::UserConfig::default());
+        app.mux = Some(crate::mux::MuxState::new(crate::mux::KeyChord {
+            code: KeyCode::Char('b'),
+            modifiers: KeyModifiers::CONTROL,
+        }));
+        push_test_pane_at(&mut app, 1, "session-a", temp.path().to_path_buf());
+        app.view = crate::app::View::Attached(1);
+        app.thread_state_root = temp.path().to_path_buf();
+        app.mux.as_mut().unwrap().pane_mut(1).unwrap().apply_hook(
+            crate::events::hooks::HookLifecycleEvent::Working { timestamp: 1 },
+            false,
+        );
+
+        let thread = test_thread(12);
+        plan_and_apply(&mut app, "session-a", &thread);
+        crate::threads::store::update_in(&app.thread_state_root, |state| {
+            state
+                .notice_mut("session-a", &thread)
+                .expect("the reply is queued")
+                .planned_at = chrono::Utc::now() - chrono::Duration::minutes(37);
+        })
+        .expect("backdating the reply");
+        app.flush_thread_wakes();
+
+        {
+            let pane = app.mux.as_mut().unwrap().pane_mut(1).unwrap();
+            pane.apply_hook(
+                crate::events::hooks::HookLifecycleEvent::Ready { timestamp: 2 },
+                false,
+            );
+            pane.confirm_hook_ready(2, false);
+        }
+        handle_attached_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE)),
+        );
+        assert!(app.mux.as_ref().unwrap().pane(1).unwrap().has_draft());
+
+        app.flush_thread_wakes();
+        assert_eq!(
+            count_with_status(&app, crate::threads::NoticeStatus::Planned),
+            1,
+            "the turn just ended; the draft has not had five minutes yet"
+        );
+        assert!(app.thread_pending.is_empty());
+    }
+
     /// A notice planned by one run is still delivered by the next.
     ///
     /// This is why the status lives on disk rather than in memory. The comment behind a
@@ -4247,7 +4591,7 @@ mod tests {
             modifiers: KeyModifiers::CONTROL,
         }));
         app.thread_state_root = temp.path().to_path_buf();
-        crate::threads::store::resume_in(temp.path()).expect("resume");
+        crate::threads::store::resume_in(temp.path(), |_| false).expect("resume");
         // Exactly what startup does, in the same order.
         app.refresh_thread_pending();
         push_test_pane_at(&mut app, 1, "session-a", temp.path().to_path_buf());
@@ -4283,7 +4627,7 @@ mod tests {
         })
         .expect("recording a notice");
 
-        crate::threads::store::resume_in(temp.path()).expect("resume");
+        crate::threads::store::resume_in(temp.path(), |_| false).expect("resume");
 
         let notices = crate::threads::store::load_in(temp.path()).notices;
         assert_eq!(notices.len(), 1);
@@ -4919,6 +5263,33 @@ mod tests {
             app.status_message.as_deref(),
             Some("Attach to a session before inspecting a GitHub item")
         );
+    }
+
+    #[test]
+    fn waiting_thread_messages_open_from_a_key_on_the_list_and_inside_a_session() {
+        // Command search was the only way in, which meant knowing the inbox existed and
+        // what it was called. It concerns every session, so it works from both places.
+        let mut app = mux_app();
+        app.view = View::List;
+        for key in [
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+        ] {
+            assert!(handle_list_prefix(&mut app, key));
+        }
+        assert_eq!(app.thread_inbox, Some(0));
+
+        let mut app = attached_mux_app("thread-inbox-key-test");
+        for key in [
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+        ] {
+            handle_attached_key(&mut app, key);
+        }
+        assert_eq!(app.thread_inbox, Some(0));
+        let _ = app.mux.as_mut().unwrap().shutdown();
     }
 
     #[test]

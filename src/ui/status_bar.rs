@@ -80,7 +80,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
                     ));
                 } else if app.github_prefix_pending() {
                     spans.push(Span::styled(
-                        "GitHub: i inspect  Esc cancel",
+                        "GitHub: i inspect  m messages  Esc cancel",
                         Style::default()
                             .fg(super::badge_foreground(theme, theme.accent))
                             .bg(theme.accent)

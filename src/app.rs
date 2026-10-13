@@ -793,9 +793,13 @@ pub struct App {
     /// How many notices are still CST's to deal with rather than the user's.
     ///
     /// Only here so the idle tick can decide it has nothing to do without reading the
-    /// state file five times a minute forever. Safe to cache because the one writer
-    /// outside this thread — the watcher — says so on the mux channel.
+    /// state file five times a minute forever. Our own watcher announces what it writes,
+    /// but every other CST running on this machine writes the same file and tells us
+    /// nothing, so the cache is only trusted while `thread_state_seen` still matches.
     thread_live_notices: usize,
+
+    /// When the state file had last been written as of the cache above being filled.
+    thread_state_seen: Option<std::time::SystemTime>,
 
     /// The last reason the thread watcher gave for not working.
     ///
@@ -1002,6 +1006,7 @@ impl App {
             thread_inbox: None,
             thread_pending: Vec::new(),
             thread_live_notices: 0,
+            thread_state_seen: None,
             thread_watch_notice: None,
             restart_after_update: None,
             update_restart_requested: false,
@@ -4329,13 +4334,17 @@ impl App {
         })
     }
 
-    /// How long a wake-up waits for a pane to become writable before the user is asked.
+    /// How long a wake-up blocked by user input waits before the user is asked.
     ///
-    /// The wait is usually seconds — a turn finishing, or a half-typed message being
-    /// sent. A draft left on screen while somebody goes to lunch would otherwise hold the
-    /// message indefinitely, and a thread nobody hears about is the exact failure this
-    /// feature exists to prevent.
+    /// Working turns are exempt: legitimate autonomous work can take much longer.
+    /// A draft left on screen while somebody goes to lunch must not hide a queued reply
+    /// indefinitely.
     const WAKE_PATIENCE_SECS: i64 = 300;
+
+    /// How stale a waiting notice's clock may get while its pane works before it is
+    /// restarted. Restarting on every pass would rewrite `threads.json` several times a
+    /// second for the length of the turn; this costs at most a minute of patience.
+    const WORKING_CLOCK_SLACK_SECS: i64 = 60;
 
     /// Act on the notices the watcher wrote down, now that pane state is knowable.
     ///
@@ -4353,11 +4362,18 @@ impl App {
     ///
     /// Called on every idle tick as well as on events, because a pane holding an
     /// abandoned draft emits nothing at all. The counter is what keeps that affordable:
-    /// an install with no notices never touches the disk, and the only thing that can
-    /// add one behind CST's back — the watcher thread — announces itself.
+    /// an install with no notices costs one `stat` a pass, which is also how a notice
+    /// written by another CST is noticed — that one announces nothing to this process.
     pub fn flush_thread_wakes(&mut self) -> bool {
+        let discovered =
+            crate::threads::store::modified_in(&self.thread_state_root) != self.thread_state_seen;
+        if discovered {
+            // Reported as a change even if nothing here gets delivered: another CST may
+            // have put something in the inbox, and the badge should show it now.
+            self.refresh_thread_pending();
+        }
         if self.thread_live_notices == 0 {
-            return false;
+            return discovered;
         }
         let live: Vec<(String, crate::threads::ThreadRef, bool, i64)> =
             crate::threads::store::load_in(&self.thread_state_root)
@@ -4379,12 +4395,30 @@ impl App {
                 })
                 .collect();
         if live.is_empty() {
-            return false;
+            return discovered;
         }
 
         let mut changed = false;
+        let mut hosted = None;
         for (session_id, thread, sent, age) in live {
             if sent {
+                if self.pane_for_session(&session_id).is_none() {
+                    if !self.session_open_elsewhere(&session_id, &mut hosted) {
+                        // Whoever had it in a composer has closed it unread, or quit.
+                        // Queued again, it reaches the inbox like any reply for a closed
+                        // session; dropped, as it used to be, nobody hears of it again.
+                        self.update_threads(|state| {
+                            if let Some(notice) = state.notice_mut(&session_id, &thread) {
+                                notice.status = crate::threads::NoticeStatus::Planned;
+                                notice.planned_at = chrono::Utc::now();
+                            }
+                        });
+                        changed = true;
+                    }
+                    // Otherwise another CST has it in its pane, and only that one can
+                    // see when the composer empties.
+                    continue;
+                }
                 // Written into the composer already. It keeps holding this session's
                 // slot until the composer is empty again, which is the evidence that a
                 // turn actually took it — otherwise the next notice would be typed on
@@ -4396,6 +4430,16 @@ impl App {
                 continue;
             }
             if !self.has_running_pane_for(&session_id) {
+                if age < Self::WAKE_PATIENCE_SECS
+                    && self.session_open_elsewhere(&session_id, &mut hosted)
+                {
+                    // Every CST watches the same threads, so the one that saw this first
+                    // is often not the one hosting the session. Leave it for that one,
+                    // with the same patience a busy pane of our own would get: a session
+                    // open in a bare terminal has nobody to deliver to, and still has to
+                    // reach the user in the end.
+                    continue;
+                }
                 // Never start a session unasked. It becomes something the user can
                 // approve, with an age, so a stalled correspondence stays visible.
                 self.hold_thread_message(
@@ -4404,6 +4448,33 @@ impl App {
                     crate::threads::PendingReason::SessionClosed,
                 );
                 changed = true;
+                continue;
+            }
+            // A long turn is not a closed session. Keep its persisted notice eligible
+            // until the ready hook arrives instead of requiring a new comment to retry.
+            //
+            // The clock restarts while it waits, so patience is measured from the end
+            // of the turn. Otherwise a turn that ends on a question for the user, or
+            // with a draft in the composer, would hold the notice at once instead of
+            // after the usual five minutes. The cost is that a turn which never ends
+            // keeps the notice queued for as long as it runs; the session list already
+            // shows that session as working, which is where somebody would look.
+            if self
+                .mux
+                .as_ref()
+                .and_then(|mux| {
+                    mux.pane_for_session(&session_id)
+                        .and_then(|id| mux.pane(id))
+                })
+                .is_some_and(|pane| pane.is_working())
+            {
+                if age >= Self::WORKING_CLOCK_SLACK_SECS {
+                    self.update_threads(|state| {
+                        if let Some(notice) = state.notice_mut(&session_id, &thread) {
+                            notice.planned_at = chrono::Utc::now();
+                        }
+                    });
+                }
                 continue;
             }
             // Readiness is re-asked per notice rather than decided once up front:
@@ -4429,9 +4500,8 @@ impl App {
                 }
                 changed = true;
             } else if age >= Self::WAKE_PATIENCE_SECS {
-                // Waited too long and still nowhere to put it. A pane that never becomes
-                // writable — a draft left on screen over lunch, a turn that never ends —
-                // must not swallow the message in silence.
+                // A draft or user-action prompt left unattended must not swallow the
+                // message in silence.
                 self.hold_thread_message(
                     &session_id,
                     &thread,
@@ -4443,7 +4513,45 @@ impl App {
         if changed {
             self.refresh_thread_pending();
         }
-        changed
+        changed || discovered
+    }
+
+    /// Whether a session is open in some process other than our panes.
+    ///
+    /// Two sources, because each misses something. Another CST's workspace record names
+    /// a tab from the moment it opens, but knows nothing of a session in a plain
+    /// terminal. Copilot's lock covers every process, but only once the session has run a
+    /// turn since it was opened, so a tab resumed after a restart and not used yet would
+    /// look closed. `hosted` holds the records, read once per pass rather than per notice.
+    ///
+    /// The lock is read from the session directory rather than `self.sessions`, which can
+    /// predate a session another CST started a minute ago.
+    fn session_open_elsewhere(
+        &self,
+        session_id: &str,
+        hosted: &mut Option<std::collections::HashSet<String>>,
+    ) -> bool {
+        hosted
+            .get_or_insert_with(|| self.sessions_hosted_elsewhere())
+            .contains(session_id)
+            || crate::session::loader::session_is_active(
+                &self.copilot_home.join("session-state").join(session_id),
+            )
+    }
+
+    /// Sessions with a tab in another running CST, by the workspace records they keep.
+    pub fn sessions_hosted_elsewhere(&self) -> std::collections::HashSet<String> {
+        self.workspace_record_root
+            .as_ref()
+            .map(|root| {
+                crate::recovery::hosted_elsewhere_in(
+                    root,
+                    (std::process::id(), self.instance_started_at),
+                    chrono::Utc::now(),
+                    crate::session::process::process_is_running,
+                )
+            })
+            .unwrap_or_default()
     }
 
     fn update_threads(&self, change: impl FnOnce(&mut crate::threads::store::ThreadState)) {
@@ -4452,8 +4560,8 @@ impl App {
 
     /// Whether a session's composer has been emptied since a notice was written into it.
     ///
-    /// A pane that has gone away counts as free, or the notice would hold that session's
-    /// slot forever against a thread that may well move again.
+    /// Only asked about a session with a pane here; one without is settled before this,
+    /// by whether its composer still exists anywhere.
     fn composer_is_free(&self, session_id: &str) -> bool {
         self.mux
             .as_ref()
@@ -4512,6 +4620,9 @@ impl App {
 
     /// Re-read the notices from disk: what the user is asked about, and what is in hand.
     pub fn refresh_thread_pending(&mut self) {
+        // Timed before reading, so a save that lands in between reads as a change on the
+        // next pass instead of being taken as already seen.
+        self.thread_state_seen = crate::threads::store::modified_in(&self.thread_state_root);
         let notices = crate::threads::store::load_in(&self.thread_state_root).notices;
         self.thread_live_notices = notices
             .iter()

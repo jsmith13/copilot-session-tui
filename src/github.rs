@@ -1242,21 +1242,32 @@ pub fn fetch_thread_comments(
     }
 }
 
+/// The comment list for an issue or pull request, from `since` on.
+///
+/// `since` is an RFC 3339 time, and a `+00:00` offset in it has to be escaped. Left bare,
+/// the `+` reaches GitHub as a space, the offset is lost, and the time is read as US
+/// Pacific: seven or eight hours later than meant. Every comment from the first hours of
+/// a subscription then fell outside the window, and since the thread's cursor had
+/// already moved on, nothing ever asked for them again.
+fn issue_comments_endpoint(target: &CommentTarget<'_>, since: Option<&str>) -> String {
+    let mut endpoint = format!(
+        "repos/{}/{}/issues/{}/comments?per_page=100",
+        target.owner, target.repo, target.number
+    );
+    if let Some(since) = since {
+        endpoint.push_str(&format!("&since={}", since.replace('+', "%2B")));
+    }
+    endpoint
+}
+
 fn fetch_issue_comments(
     runner: &ProcessGhRunner,
     cwd: &Path,
     target: CommentTarget<'_>,
     since: Option<&str>,
 ) -> Result<Vec<ThreadComment>, GithubError> {
-    let mut endpoint = format!(
-        "repos/{}/{}/issues/{}/comments?per_page=100",
-        target.owner, target.repo, target.number
-    );
-    if let Some(since) = since {
-        endpoint.push_str(&format!("&since={since}"));
-    }
     let mut args = strings(&["api", "--hostname", target.host, "--paginate", "--slurp"]);
-    args.push(endpoint);
+    args.push(issue_comments_endpoint(&target, since));
 
     let stdout = runner.run(cwd, &args)?;
     // `--slurp` wraps each page in an outer array; flattening is what `api_pages` does.
@@ -3641,5 +3652,32 @@ mod tests {
     fn no_logged_in_hosts_is_reported_as_unauthenticated_rather_than_an_error() {
         let hosts = parse_auth_status_json(br#"{"hosts":{}}"#).expect("payload parses");
         assert_eq!(classify_hosts(hosts), GhAuth::NoHosts);
+    }
+
+    #[test]
+    fn a_subscription_time_reaches_github_with_its_offset_intact() {
+        // A bare + arrives as a space, GitHub drops the offset and reads the time as
+        // Pacific, and every reply from the first hours of a subscription is skipped.
+        let target = CommentTarget {
+            host: "github.com",
+            owner: "tupini07",
+            repo: "copilot-session-tui",
+            number: 2,
+            discussion: false,
+        };
+        let since = chrono::DateTime::parse_from_rfc3339("2026-10-13T18:34:16.927104400Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+            .to_rfc3339();
+
+        let endpoint = issue_comments_endpoint(&target, Some(&since));
+
+        assert_eq!(
+            endpoint,
+            concat!(
+                "repos/tupini07/copilot-session-tui/issues/2/comments?per_page=100",
+                "&since=2026-10-13T18:34:16.927104400%2B00:00"
+            )
+        );
     }
 }

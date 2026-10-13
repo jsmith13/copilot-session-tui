@@ -148,11 +148,9 @@ pub fn recoverable_in(
 ) -> Vec<Recoverable> {
     let mut records = load_all_in(root);
     records.sort_by_key(|(_, record)| std::cmp::Reverse(record.saved_at));
-    let stale_after = chrono::Duration::from_std(STALE_AFTER).unwrap_or_default();
     let mut offered = Vec::new();
     for (kept, (path, record)) in records.into_iter().enumerate() {
-        let alive = process_running(record.pid) && now - record.saved_at < stale_after;
-        if (record.pid, record.started_at) == me || alive {
+        if (record.pid, record.started_at) == me || is_live(&record, now, &process_running) {
             continue;
         }
         if kept >= KEEP || now - record.saved_at > chrono::Duration::days(MAX_AGE_DAYS) {
@@ -176,6 +174,39 @@ pub fn recoverable_in(
         }
     }
     offered
+}
+
+/// Whether the instance that wrote a record is still running.
+fn is_live(
+    record: &WorkspaceRecord,
+    now: DateTime<Utc>,
+    process_running: impl Fn(u32) -> bool,
+) -> bool {
+    let stale_after = chrono::Duration::from_std(STALE_AFTER).unwrap_or_default();
+    process_running(record.pid) && now - record.saved_at < stale_after
+}
+
+/// The sessions open right now in a CST other than `me`.
+///
+/// Copilot's lock file says the same thing only once a session has run a turn since it
+/// was opened, so a session resumed into another CST's tab and not used yet looks closed
+/// by that measure. These records are written as soon as a tab opens, whether anything
+/// has happened in it or not.
+pub fn hosted_elsewhere_in(
+    root: &Path,
+    me: (u32, DateTime<Utc>),
+    now: DateTime<Utc>,
+    process_running: impl Fn(u32) -> bool,
+) -> std::collections::HashSet<String> {
+    load_all_in(root)
+        .into_iter()
+        .map(|(_, record)| record)
+        .filter(|record| {
+            (record.pid, record.started_at) != me && is_live(record, now, &process_running)
+        })
+        .flat_map(|record| record.sessions)
+        .map(|session| session.session_id)
+        .collect()
 }
 
 /// "12m ago", "3h ago", "2d ago".
@@ -310,5 +341,24 @@ mod tests {
             focused_session_id: None,
         }];
         assert_eq!(workspace.tab_count(), 2);
+    }
+
+    #[test]
+    fn only_sessions_in_another_running_instance_count_as_open_elsewhere() {
+        // A tab opened and not used yet has no Copilot lock, and another CST that took
+        // that for "closed" would send the session's replies to the inbox.
+        let root = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let mine = record(1, 0, &["mine"], now);
+        write_in(root.path(), &mine).unwrap();
+        write_in(root.path(), &record(2, 1, &["other-a", "other-b"], now)).unwrap();
+        write_in(root.path(), &record(3, 0, &["crashed"], now)).unwrap();
+        write_in(root.path(), &record(4, 20, &["reused-pid"], now)).unwrap();
+
+        let open = hosted_elsewhere_in(root.path(), (1, mine.started_at), now, |pid| pid != 3);
+
+        let mut open: Vec<_> = open.into_iter().collect();
+        open.sort();
+        assert_eq!(open, vec!["other-a", "other-b"]);
     }
 }

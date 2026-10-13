@@ -1050,6 +1050,11 @@ pub fn draw_help(f: &mut Frame, app: &mut App) {
         ));
         text.push(help_line(
             theme,
+            &format!("{prefix} g m"),
+            "Thread messages waiting for you",
+        ));
+        text.push(help_line(
+            theme,
             &format!("{prefix} h e"),
             "Open scratchpad shortcut help",
         ));

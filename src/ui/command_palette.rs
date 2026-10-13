@@ -154,6 +154,7 @@ fn draw_prefix_menu(f: &mut Frame, app: &App) {
             "Tools",
             vec![
                 ("g i", "GitHub inspector"),
+                ("g m", "Waiting messages"),
                 ("h e", "Scratchpad help"),
                 ("u", "Update CST"),
                 // The layout keys themselves are listed once `l` is pressed; here it

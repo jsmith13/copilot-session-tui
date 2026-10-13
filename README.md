@@ -351,6 +351,7 @@ While attached to a session, every keystroke goes to Copilot except the prefix k
 | `prefix` `u` | Install an update without stopping running sessions |
 | `prefix` `h` `e` | Open scratchpad shortcut help |
 | `prefix` `g` `i` | Inspect a GitHub issue, pull request, or discussion |
+| `prefix` `g` `m` | Thread messages waiting for you |
 | `prefix` `n` / `p` | Next / previous tab |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab, as in a browser — from any panel, no prefix. Windows Terminal keeps these for its own tabs unless you unbind them there |
 | `Ctrl+PageDown` / `Ctrl+PageUp` | The same, and these reach CST in Windows Terminal as it comes |
@@ -765,7 +766,17 @@ thread for you to read like any other comment.
 
 A message for a session that is closed waits for you, because CST will not start a
 session just because somebody commented. Those show up marked `@` in the session list
-with how long they have waited, and under **Waiting for you** in the command palette.
+with how long they have waited, and under **Waiting for you**: `prefix` `g` `m`, or the
+command palette.
+
+Replies to a working session stay queued until its current turn finishes, even when that
+turn takes longer than five minutes. CST never injects them into a working turn or an
+unsent draft. If the turn ends on a question for you, or with a draft left in the
+composer, the reply waits about five more minutes and then moves to **Waiting for you**.
+
+With several CSTs open, any of them may see a reply first, and whichever one has the
+session open delivers it. A session that is open somewhere no CST can reach, such as a
+plain terminal, gets about five minutes before its message moves to **Waiting for you**.
 
 To work with a colleague's agent, name them:
 
@@ -789,8 +800,10 @@ stops a conversation on its own.
 Every notice is written down — whether it is still queued, already in a session's
 composer, or waiting for you — so closing CST mid-delivery does not drop it. On the way
 back up, anything that had reached a composer is offered again, since that composer is
-gone. Comments posted while CST was closed are picked up on the next poll, because a
-thread's place is kept per subscription rather than per run.
+gone, unless the session is still open in another CST, which keeps it. A message still
+unread in a composer when its session closes goes to **Waiting for you**. Comments posted
+while CST was closed are picked up on the next poll, because a thread's place is kept per
+subscription rather than per run.
 
 ### Settings
 
