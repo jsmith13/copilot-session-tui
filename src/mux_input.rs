@@ -4145,6 +4145,51 @@ mod tests {
     }
 
     #[test]
+    fn a_tab_another_instance_opened_but_has_not_used_yet_still_counts_as_open() {
+        // Copilot only takes its lock once a session runs a turn, so right after a CST
+        // restarts, every tab it resumed looks closed by that measure. Found in the
+        // end-to-end run: the other instance's workspace record is what still shows it.
+        let temp = tempfile::tempdir().unwrap();
+        let mut other = App::new(Vec::new(), crate::config::UserConfig::default());
+        other.mux = Some(crate::mux::MuxState::new(crate::mux::KeyChord {
+            code: KeyCode::Char('b'),
+            modifiers: KeyModifiers::CONTROL,
+        }));
+        other.copilot_home = temp.path().to_path_buf();
+        other.thread_state_root = temp.path().to_path_buf();
+        let records = temp.path().join("workspaces");
+        other.workspace_record_root = Some(records.clone());
+        // Another instance: this test's pid stands in for a running process, and a
+        // different start time makes it somebody else's record.
+        crate::recovery::write_in(
+            &records,
+            &crate::recovery::WorkspaceRecord {
+                pid: std::process::id(),
+                started_at: other.instance_started_at - chrono::Duration::minutes(5),
+                saved_at: chrono::Utc::now(),
+                launch_dir: None,
+                sessions: vec![crate::recovery::RecordedSession {
+                    session_id: "session-a".to_string(),
+                    cwd: temp.path().display().to_string(),
+                    title: "session-a".to_string(),
+                }],
+                focused_session_id: None,
+                windows: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        plan_and_apply(&mut other, "session-a", &test_thread(12));
+
+        assert_eq!(
+            count_with_status(&other, crate::threads::NoticeStatus::Planned),
+            1,
+            "got: {:?}",
+            notices_in(&other)
+        );
+    }
+
+    #[test]
     fn a_reply_left_for_another_instance_still_reaches_the_user_if_nobody_delivers_it() {
         // The session may be open in a bare terminal, or in a CST too old to look. Standing
         // aside forever would lose the reply exactly the way the bug did.

@@ -490,10 +490,12 @@ fn main() -> Result<()> {
     // the first frame rather than only after the next comment arrives. The comment behind
     // a notice is marked seen as soon as it is planned, so a notice dropped here would be
     // a message nobody is ever told about again.
-    // Nothing is open in this process yet, so a session Copilot reports as running is
-    // one another CST still has, along with whatever is in its composer.
+    // Nothing is open in this process yet, so a session that is open is one another CST
+    // still has, along with whatever is in its composer.
+    let hosted_elsewhere = app.sessions_hosted_elsewhere();
     let still_open = |session: &str| {
-        loader::session_is_active(&copilot_home.join("session-state").join(session))
+        hosted_elsewhere.contains(session)
+            || loader::session_is_active(&copilot_home.join("session-state").join(session))
     };
     if let Err(error) = threads::store::resume_in(&app.thread_state_root, still_open) {
         eprintln!("Could not resume thread notices: {error}");

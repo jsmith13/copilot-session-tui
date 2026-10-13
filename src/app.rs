@@ -4399,10 +4399,11 @@ impl App {
         }
 
         let mut changed = false;
+        let mut hosted = None;
         for (session_id, thread, sent, age) in live {
             if sent {
                 if self.pane_for_session(&session_id).is_none() {
-                    if !self.session_open_elsewhere(&session_id) {
+                    if !self.session_open_elsewhere(&session_id, &mut hosted) {
                         // Whoever had it in a composer has closed it unread, or quit.
                         // Queued again, it reaches the inbox like any reply for a closed
                         // session; dropped, as it used to be, nobody hears of it again.
@@ -4429,7 +4430,9 @@ impl App {
                 continue;
             }
             if !self.has_running_pane_for(&session_id) {
-                if age < Self::WAKE_PATIENCE_SECS && self.session_open_elsewhere(&session_id) {
+                if age < Self::WAKE_PATIENCE_SECS
+                    && self.session_open_elsewhere(&session_id, &mut hosted)
+                {
                     // Every CST watches the same threads, so the one that saw this first
                     // is often not the one hosting the session. Leave it for that one,
                     // with the same patience a busy pane of our own would get: a session
@@ -4513,14 +4516,42 @@ impl App {
         changed || discovered
     }
 
-    /// Whether Copilot says a session is running, in some process other than our panes.
+    /// Whether a session is open in some process other than our panes.
     ///
-    /// Read from the session directory rather than `self.sessions`, which can predate a
-    /// session another CST started a minute ago.
-    fn session_open_elsewhere(&self, session_id: &str) -> bool {
-        crate::session::loader::session_is_active(
-            &self.copilot_home.join("session-state").join(session_id),
-        )
+    /// Two sources, because each misses something. Another CST's workspace record names
+    /// a tab from the moment it opens, but knows nothing of a session in a plain
+    /// terminal. Copilot's lock covers every process, but only once the session has run a
+    /// turn since it was opened, so a tab resumed after a restart and not used yet would
+    /// look closed. `hosted` holds the records, read once per pass rather than per notice.
+    ///
+    /// The lock is read from the session directory rather than `self.sessions`, which can
+    /// predate a session another CST started a minute ago.
+    fn session_open_elsewhere(
+        &self,
+        session_id: &str,
+        hosted: &mut Option<std::collections::HashSet<String>>,
+    ) -> bool {
+        hosted
+            .get_or_insert_with(|| self.sessions_hosted_elsewhere())
+            .contains(session_id)
+            || crate::session::loader::session_is_active(
+                &self.copilot_home.join("session-state").join(session_id),
+            )
+    }
+
+    /// Sessions with a tab in another running CST, by the workspace records they keep.
+    pub fn sessions_hosted_elsewhere(&self) -> std::collections::HashSet<String> {
+        self.workspace_record_root
+            .as_ref()
+            .map(|root| {
+                crate::recovery::hosted_elsewhere_in(
+                    root,
+                    (std::process::id(), self.instance_started_at),
+                    chrono::Utc::now(),
+                    crate::session::process::process_is_running,
+                )
+            })
+            .unwrap_or_default()
     }
 
     fn update_threads(&self, change: impl FnOnce(&mut crate::threads::store::ThreadState)) {
