@@ -4197,6 +4197,45 @@ mod tests {
     }
 
     #[test]
+    fn a_reply_left_unread_in_a_composer_that_closed_reaches_the_inbox_instead_of_vanishing() {
+        // The CST that typed the link quit, or its tab was closed, before any turn took
+        // it. Every other CST now reads the file and would count a composer it never had
+        // as empty, which used to drop the reply without a word to anyone.
+        let temp = tempfile::tempdir().unwrap();
+        let mut other = App::new(Vec::new(), crate::config::UserConfig::default());
+        other.mux = Some(crate::mux::MuxState::new(crate::mux::KeyChord {
+            code: KeyCode::Char('b'),
+            modifiers: KeyModifiers::CONTROL,
+        }));
+        other.copilot_home = temp.path().to_path_buf();
+        other.thread_state_root = temp.path().to_path_buf();
+        let thread = test_thread(12);
+        crate::threads::store::update_in(temp.path(), |state| {
+            state.record_notice(crate::threads::Notice {
+                session_id: "session-a".to_string(),
+                thread: thread.clone(),
+                comment_url: thread.url(),
+                author: None,
+                status: crate::threads::NoticeStatus::Sent,
+                planned_at: chrono::Utc::now(),
+            });
+        })
+        .unwrap();
+
+        other.flush_thread_wakes();
+        other.flush_thread_wakes();
+
+        assert_eq!(
+            other
+                .thread_pending_for("session-a")
+                .and_then(crate::threads::Notice::reason),
+            Some(crate::threads::PendingReason::SessionClosed),
+            "got: {:?}",
+            notices_in(&other)
+        );
+    }
+
+    #[test]
     fn the_instance_with_the_session_open_delivers_a_reply_another_instance_planned() {
         // The other half. The poll cursors are shared too, so once one instance has seen
         // a comment, every other one is told by GitHub that nothing changed. The file is
@@ -4499,7 +4538,7 @@ mod tests {
             modifiers: KeyModifiers::CONTROL,
         }));
         app.thread_state_root = temp.path().to_path_buf();
-        crate::threads::store::resume_in(temp.path()).expect("resume");
+        crate::threads::store::resume_in(temp.path(), |_| false).expect("resume");
         // Exactly what startup does, in the same order.
         app.refresh_thread_pending();
         push_test_pane_at(&mut app, 1, "session-a", temp.path().to_path_buf());
@@ -4535,7 +4574,7 @@ mod tests {
         })
         .expect("recording a notice");
 
-        crate::threads::store::resume_in(temp.path()).expect("resume");
+        crate::threads::store::resume_in(temp.path(), |_| false).expect("resume");
 
         let notices = crate::threads::store::load_in(temp.path()).notices;
         assert_eq!(notices.len(), 1);

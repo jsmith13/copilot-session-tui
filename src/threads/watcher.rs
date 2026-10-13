@@ -1113,7 +1113,7 @@ mod tests {
         })
         .unwrap();
 
-        store::resume_in(root.path()).expect("the next run reads the same file");
+        store::resume_in(root.path(), |_| false).expect("the next run reads the same file");
 
         let after_restart = store::load_in(root.path());
         let survivor = after_restart

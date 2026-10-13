@@ -4401,11 +4401,21 @@ impl App {
         let mut changed = false;
         for (session_id, thread, sent, age) in live {
             if sent {
-                if self.pane_for_session(&session_id).is_none()
-                    && self.session_open_elsewhere(&session_id)
-                {
-                    // Another CST wrote it into its pane, and only that one can see when
-                    // the composer empties. Freeing the slot from here would be guessing.
+                if self.pane_for_session(&session_id).is_none() {
+                    if !self.session_open_elsewhere(&session_id) {
+                        // Whoever had it in a composer has closed it unread, or quit.
+                        // Queued again, it reaches the inbox like any reply for a closed
+                        // session; dropped, as it used to be, nobody hears of it again.
+                        self.update_threads(|state| {
+                            if let Some(notice) = state.notice_mut(&session_id, &thread) {
+                                notice.status = crate::threads::NoticeStatus::Planned;
+                                notice.planned_at = chrono::Utc::now();
+                            }
+                        });
+                        changed = true;
+                    }
+                    // Otherwise another CST has it in its pane, and only that one can
+                    // see when the composer empties.
                     continue;
                 }
                 // Written into the composer already. It keeps holding this session's
@@ -4519,8 +4529,8 @@ impl App {
 
     /// Whether a session's composer has been emptied since a notice was written into it.
     ///
-    /// A pane that has gone away counts as free, or the notice would hold that session's
-    /// slot forever against a thread that may well move again.
+    /// Only asked about a session with a pane here; one without is settled before this,
+    /// by whether its composer still exists anywhere.
     fn composer_is_free(&self, session_id: &str) -> bool {
         self.mux
             .as_ref()

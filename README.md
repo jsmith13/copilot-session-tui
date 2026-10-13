@@ -798,8 +798,10 @@ stops a conversation on its own.
 Every notice is written down — whether it is still queued, already in a session's
 composer, or waiting for you — so closing CST mid-delivery does not drop it. On the way
 back up, anything that had reached a composer is offered again, since that composer is
-gone. Comments posted while CST was closed are picked up on the next poll, because a
-thread's place is kept per subscription rather than per run.
+gone, unless the session is still open in another CST, which keeps it. A message still
+unread in a composer when its session closes goes to **Waiting for you**. Comments posted
+while CST was closed are picked up on the next poll, because a thread's place is kept per
+subscription rather than per run.
 
 ### Settings
 

@@ -214,9 +214,13 @@ impl ThreadState {
     /// Only correct at startup. Running it on every read would undo the sent marking
     /// within a single session and write the same notice over and over, which is the
     /// bug this whole mechanism exists to prevent.
-    fn resume_after_restart(&mut self) {
+    ///
+    /// Except where `still_open` says the session is running: then the composer belongs
+    /// to another CST that is still up, the pointer is sitting in it, and queueing it
+    /// again would have that CST type it a second time once the first is taken.
+    fn resume_after_restart(&mut self, still_open: impl Fn(&str) -> bool) {
         for notice in &mut self.notices {
-            if notice.status == NoticeStatus::Sent {
+            if notice.status == NoticeStatus::Sent && !still_open(&notice.session_id) {
                 notice.status = NoticeStatus::Planned;
             }
         }
@@ -238,8 +242,10 @@ pub fn load_in(root: &Path) -> ThreadState {
 }
 
 /// Load once at startup, putting anything a previous run left mid-flight back in hand.
-pub fn resume_in(root: &Path) -> Result<()> {
-    update_in(root, |state| state.resume_after_restart())
+///
+/// `still_open` answers whether a session is running in some other process right now.
+pub fn resume_in(root: &Path, still_open: impl Fn(&str) -> bool) -> Result<()> {
+    update_in(root, |state| state.resume_after_restart(still_open))
 }
 
 /// Read, change and save under one lock held for the whole cycle.
@@ -587,5 +593,32 @@ mod tests {
             load_in(temp.path()).cursors.get(&thread(1).url()),
             Some(&"W/\"abc\"".to_string())
         );
+    }
+    #[test]
+    fn starting_another_cst_leaves_a_reply_alone_in_a_composer_that_is_still_open() {
+        // Restart recovery assumed the composer died with the process that started. With
+        // a second CST opening beside a running one, the composer is alive and still
+        // holds the link; queueing it again had the first CST type it a second time.
+        let temp = tempfile::tempdir().unwrap();
+        update_in(temp.path(), |state| {
+            let mut elsewhere = notice(1, NoticeStatus::Sent, Utc::now());
+            elsewhere.session_id = "open-elsewhere".to_string();
+            let mut gone = notice(2, NoticeStatus::Sent, Utc::now());
+            gone.session_id = "closed-with-cst".to_string();
+            state.notices = vec![elsewhere, gone];
+        })
+        .unwrap();
+
+        resume_in(temp.path(), |session| session == "open-elsewhere").unwrap();
+
+        let status = |id: &str| {
+            load_in(temp.path())
+                .notices
+                .into_iter()
+                .find(|notice| notice.session_id == id)
+                .map(|notice| notice.status)
+        };
+        assert_eq!(status("open-elsewhere"), Some(NoticeStatus::Sent));
+        assert_eq!(status("closed-with-cst"), Some(NoticeStatus::Planned));
     }
 }
