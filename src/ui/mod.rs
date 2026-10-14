@@ -386,20 +386,6 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.confirm_quit {
         popups::draw_quit_confirm(f, app);
     }
-
-    // Drawn last so it covers everything: the next loop iteration blocks on Git, and
-    // this frame is the only feedback the user gets until it returns.
-    if let Some(pending) = app.pending_worktree.as_ref() {
-        popups::draw_busy(
-            f,
-            "Creating worktree",
-            &format!(
-                "Branch '{}' — copying files and checking out…",
-                pending.branch
-            ),
-            theme,
-        );
-    }
 }
 
 fn draw_context_overlays(f: &mut Frame, app: &mut App, theme: Theme) {

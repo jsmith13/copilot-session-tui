@@ -17,25 +17,103 @@ const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 
 /// Progress indicator shown while a freshly spawned session has yet to draw anything.
 fn draw_starting(f: &mut Frame, area: Rect, elapsed: Duration, theme: Theme) {
-    let frame = SPINNER[(elapsed.as_millis() / 120) as usize % SPINNER.len()];
     let seconds = elapsed.as_secs();
+    // Only mention the wait once it is long enough to be worth reassuring about.
+    let detail = (seconds >= 3).then(|| format!("{seconds}s — the CLI is still booting"));
+    draw_waiting(
+        f,
+        area,
+        elapsed,
+        "Starting Copilot…",
+        detail.into_iter().collect(),
+        theme,
+    );
+}
 
+/// Progress shown in a tab whose worktree is still being created.
+///
+/// The count matters more than the spinner: copying a virtualenv named in
+/// `.worktreeinclude` can run for an hour, and only a number that moves tells that
+/// apart from a hang.
+fn draw_preparing(
+    f: &mut Frame,
+    area: Rect,
+    elapsed: Duration,
+    preparing: &crate::app::PreparingWorktree,
+    theme: Theme,
+) {
+    use crate::session::worktree::CreationStage;
+    let stage = match preparing.progress.stage() {
+        CreationStage::CheckingOut => "Checking out the branch".to_string(),
+        CreationStage::FindingIncludes => "Finding the files .worktreeinclude names".to_string(),
+        CreationStage::CopyingIncludes { copied, total } => format!(
+            "Copying files named in .worktreeinclude: {} of {}",
+            grouped(copied),
+            grouped(total)
+        ),
+    };
+    draw_waiting(
+        f,
+        area,
+        elapsed,
+        &format!("Creating worktree for '{}'…", preparing.branch),
+        vec![
+            stage,
+            format!(
+                "{} so far — other tabs work as usual; closing this one cancels it",
+                wait_label(elapsed)
+            ),
+        ],
+        theme,
+    );
+}
+
+/// `48219` as `48,219`: counts this size are read at a glance, not digit by digit.
+fn grouped(count: usize) -> String {
+    let digits = count.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+fn wait_label(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    match seconds {
+        0..60 => format!("{seconds}s"),
+        60..3600 => format!("{}m {:02}s", seconds / 60, seconds % 60),
+        _ => format!("{}h {:02}m", seconds / 3600, seconds % 3600 / 60),
+    }
+}
+
+fn draw_waiting(
+    f: &mut Frame,
+    area: Rect,
+    elapsed: Duration,
+    headline: &str,
+    details: Vec<String>,
+    theme: Theme,
+) {
+    let frame = SPINNER[(elapsed.as_millis() / 120) as usize % SPINNER.len()];
     let mut lines = vec![
         Line::from(""),
         Line::from(Span::styled(
-            format!("  {frame}  Starting Copilot…"),
+            format!("  {frame}  {headline}"),
             Style::default()
                 .fg(theme.accent_alt)
                 .add_modifier(Modifier::BOLD),
         )),
     ];
-    // Only mention the wait once it is long enough to be worth reassuring about.
-    if seconds >= 3 {
-        lines.push(Line::from(Span::styled(
-            format!("     {seconds}s — the CLI is still booting"),
+    lines.extend(details.into_iter().map(|detail| {
+        Line::from(Span::styled(
+            format!("     {detail}"),
             Style::default().fg(theme.muted),
-        )));
-    }
+        ))
+    }));
 
     let height = lines.len() as u16;
     let box_area = Rect {
@@ -380,7 +458,15 @@ fn draw_chat(f: &mut Frame, app: &App, slot: &ChatSlot, in_split: bool) {
         decorate_references(f, app, terminal_area, theme);
     }
 
-    if starting {
+    if let Some(preparing) = app.preparing_worktree(pane.id) {
+        draw_preparing(
+            f,
+            terminal_area,
+            pane.started_at.elapsed(),
+            preparing,
+            theme,
+        );
+    } else if starting {
         draw_starting(f, terminal_area, pane.started_at.elapsed(), theme);
     }
 }
@@ -2260,5 +2346,55 @@ mod tests {
             Some(accent)
         );
         let _ = app.mux.as_mut().expect("mux").shutdown();
+    }
+    /// The count is what tells an hour-long copy apart from a hang; a tab that said
+    /// "Starting Copilot" instead would be both wrong and the same silence as before.
+    #[test]
+    fn a_tab_waiting_on_its_worktree_counts_the_files_copied_instead_of_saying_copilot_is_starting()
+    {
+        let mut app = mux_app();
+        let events = app.mux.as_ref().expect("mux").events.clone();
+        app.mux.as_mut().expect("mux").push(Pane::unlaunched(
+            1,
+            "feature".to_string(),
+            std::env::temp_dir(),
+            "waiting-session".to_string(),
+            24,
+            80,
+            Some(false),
+            events,
+        ));
+        app.view = crate::app::View::Attached(1);
+        let progress = std::sync::Arc::new(crate::session::worktree::CreationProgress::default());
+        progress.plan_copies(48219);
+        progress.note_copied(31209);
+        app.preparing_worktrees.push(crate::app::PreparingWorktree {
+            pane: 1,
+            branch: "feature".to_string(),
+            progress,
+        });
+
+        let text = render_buffer(&mut app, 120, 24)
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(
+            text.contains("Creating worktree for 'feature'"),
+            "got:\n{text}"
+        );
+        assert!(text.contains("31,209 of 48,219"), "got:\n{text}");
+        assert!(!text.contains("Starting Copilot"), "got:\n{text}");
+    }
+
+    #[test]
+    fn counts_are_grouped_in_thousands_and_waits_read_in_the_largest_useful_unit() {
+        assert_eq!(grouped(7), "7");
+        assert_eq!(grouped(48219), "48,219");
+        assert_eq!(grouped(1234567), "1,234,567");
+        assert_eq!(wait_label(Duration::from_secs(42)), "42s");
+        assert_eq!(wait_label(Duration::from_secs(605)), "10m 05s");
+        assert_eq!(wait_label(Duration::from_secs(5520)), "1h 32m");
     }
 }

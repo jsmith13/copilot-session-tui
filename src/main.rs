@@ -1211,6 +1211,7 @@ fn run_app(
         // waiting on a half-typed message, and a pane holding an abandoned draft emits
         // no events at all. Cheap — the queue is almost always empty.
         repaint |= app.flush_thread_wakes();
+        app.cancel_orphaned_worktrees();
         // Covers every route into the Files tab — keys, mouse, or opening
         // straight onto it — rather than each one separately.
         if app.github_files_tab_active() {
@@ -1240,15 +1241,8 @@ fn run_app(
             last_paint = std::time::Instant::now();
         }
 
-        // Runs after the draw above so the "creating worktree…" notice is already on
-        // screen before this blocks on Git.
-        if let Some(pending) = app.pending_worktree.take() {
-            input::run_pending_worktree(app, pending);
-            continue;
-        }
-
-        // Same contract: the tmux server start and its startup grace block for long
-        // enough that the launch notice must be painted first.
+        // Runs after the draw above so the launch notice is already on screen: the tmux
+        // server start and its startup grace block for long enough to need one.
         if let Some(pending) = app.pending_tmux_launch.take() {
             input::run_pending_tmux_launch(app, pending);
             continue;
@@ -1588,9 +1582,14 @@ fn synchronized_frame<W: io::Write>(
 
 fn mux_animating(app: &App) -> bool {
     app.mux.as_ref().is_some_and(|mux| {
-        mux.panes
-            .iter()
-            .any(|pane| pane.is_running() && pane.is_blank())
+        mux.panes.iter().any(|pane| {
+            // A tab waiting on its worktree can wait for an hour. Spinning it while it
+            // is off screen would hold the fast redraw cadence all that time for
+            // nothing anyone sees; the result arriving wakes the loop anyway.
+            pane.is_running()
+                && pane.is_blank()
+                && (pane.is_launched() || app.pane_on_screen(pane.id))
+        })
     }) || tab_spinner_animating(app)
         || app.github_loading()
         || app.sessions_loading()

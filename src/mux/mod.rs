@@ -9,7 +9,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 
-pub use pane::{Pane, PaneId, PaneSpec, PaneStatus};
+pub use pane::{Pane, PaneId, PaneLaunch, PaneSpec, PaneStatus};
 pub use split::{LayoutNode, SplitDirection, SplitStep, Window, WindowId};
 
 /// Events the UI loop must wake up for, from PTYs and from the terminal.
@@ -31,6 +31,8 @@ pub enum MuxEvent {
     ThreadWatchFailed(String),
     /// A watched thread looks like it is going in circles. Reported, never acted on.
     ThreadStalled(String),
+    /// The worktree a tab was opened for has been created, or could not be.
+    WorktreeReady(PaneId, Box<crate::app::WorktreeOutcome>),
     Term(crossterm::event::Event),
 }
 
