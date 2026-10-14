@@ -975,14 +975,7 @@ impl App {
         let unique_projects = extract_unique_projects(&sessions);
         let filtered_indices: Vec<usize> = (0..sessions.len()).collect();
         let mux_on_disk = config.mux;
-
-        // An unparseable prefix falls back to the default rather than refusing to start.
-        let mux = config.mux.then(|| {
-            let prefix = KeyChord::parse(&config.mux_prefix)
-                .or_else(|| KeyChord::parse(crate::config::DEFAULT_MUX_PREFIX))
-                .expect("the default mux prefix must parse");
-            MuxState::new(prefix)
-        });
+        let mux = config.mux.then(|| new_mux(&config));
 
         let mut app = App {
             sessions,
@@ -1145,6 +1138,53 @@ impl App {
         let mut config = self.config.clone();
         config.mux = self.mux_on_disk;
         config
+    }
+
+    /// Change the saved multiplexer setting, and the mode of this run along with it.
+    ///
+    /// The run follows even when it was started with `--mux` or `--no-mux`: an update
+    /// restart always passes one of the two, so a toggle that deferred to the flag would
+    /// stop working after the first update. The main loop does the actual switch.
+    pub fn set_mux_setting(&mut self, enabled: bool) {
+        self.mux_on_disk = enabled;
+        self.config.mux = enabled;
+        self.status_message = Some(
+            if enabled {
+                "Multiplexer on: sessions open as tabs inside CST"
+            } else if self.mux_can_stop() {
+                "Multiplexer off: sessions open in the terminal"
+            } else {
+                "Multiplexer off: sessions open in the terminal once the open tabs are closed"
+            }
+            .to_string(),
+        );
+    }
+
+    /// Whether the multiplexer can be taken down without ending a session with it.
+    pub fn mux_can_stop(&self) -> bool {
+        self.mux.as_ref().is_none_or(|mux| mux.panes.is_empty())
+            && self.preparing_worktrees.is_empty()
+            && self.pending_tmux_launch.is_none()
+    }
+
+    pub fn start_mux(&mut self) {
+        if self.mux.is_none() {
+            self.mux = Some(new_mux(&self.config));
+        }
+    }
+
+    pub fn stop_mux(&mut self) {
+        debug_assert!(
+            self.mux_can_stop(),
+            "stopping the multiplexer would end sessions"
+        );
+        self.mux = None;
+        // The launcher has no attached screen to draw, whatever led here.
+        self.view = View::List;
+        // Keyed by pane id, and a multiplexer started later numbers its panes from 1
+        // again: a leftover entry would open a panel on a session that never had one.
+        self.scratchpad_open.clear();
+        self.terminal_open.clear();
     }
 
     /// Open the pane switcher, pre-selecting the currently focused pane.
@@ -1446,8 +1486,9 @@ impl App {
     }
 
     fn adopt_persisted_config(&mut self, mut persisted: UserConfig) {
-        // Mux is fixed for the lifetime of this App, including a CLI-only override.
-        // Remember the refreshed disk value for future saves but keep the live mode.
+        // Only this instance's own settings toggle switches its live mode. Another
+        // instance flipping the setting would otherwise rearrange this one under the
+        // user, so the disk value is only remembered for future saves.
         let selected_id = self.selected_session().map(|session| session.id.clone());
         let favorites_changed = self.config.favorites != persisted.favorites;
         let hidden_title_prefixes_changed =
@@ -5387,6 +5428,14 @@ impl App {
     }
 }
 
+fn new_mux(config: &UserConfig) -> MuxState {
+    // An unparseable prefix falls back to the default rather than refusing to start.
+    let prefix = KeyChord::parse(&config.mux_prefix)
+        .or_else(|| KeyChord::parse(crate::config::DEFAULT_MUX_PREFIX))
+        .expect("the default mux prefix must parse");
+    MuxState::new(prefix)
+}
+
 fn extract_unique_projects(sessions: &[Session]) -> Vec<String> {
     use chrono::{DateTime, Utc};
     // Track the most recent updated_at per project (using resolved project_root)
@@ -5568,6 +5617,34 @@ mod tests {
     }
 
     #[test]
+    fn turning_the_multiplexer_on_beats_a_command_line_flag_so_it_still_works_after_an_update() {
+        // An update restart relaunches a launcher-mode CST with `--no-mux`, every time.
+        let mut app = app_with(false);
+        app.mux_on_disk = false;
+
+        app.set_mux_setting(!app.mux_on_disk);
+
+        assert!(
+            app.config.mux,
+            "the main loop brings the multiplexer up from this"
+        );
+        assert!(app.persistable_config().mux);
+    }
+
+    #[test]
+    fn stopping_the_multiplexer_forgets_panels_a_later_pane_could_inherit_by_its_number() {
+        let mut app = app_with(true);
+        app.scratchpad_open.insert(1);
+        app.terminal_open.insert(1);
+
+        app.stop_mux();
+        app.start_mux();
+
+        assert!(app.scratchpad_open.is_empty());
+        assert!(app.terminal_open.is_empty());
+    }
+
+    #[test]
     fn settings_toggle_is_persisted() {
         let mut app = app_with(false);
         app.mux_on_disk = true;
@@ -5684,7 +5761,10 @@ mod tests {
 
         assert!(app.request_config_reload());
 
-        assert!(app.config.mux, "the running mux cannot change in place");
+        assert!(
+            app.config.mux,
+            "another instance turning it off does not rearrange this one"
+        );
         assert!(!app.mux_on_disk);
         assert_eq!(
             app.mux.as_ref().unwrap().prefix.label(),

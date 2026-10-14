@@ -1438,7 +1438,7 @@ pub fn draw_settings(f: &mut Frame, app: &mut App) {
         false,
     ));
     lines.push(Line::from(Span::styled(
-        "    Run sessions inside CST as panes (applies on restart)",
+        "    Run sessions inside CST as panes instead of handing over the terminal",
         Style::default().fg(theme.muted),
     )));
 

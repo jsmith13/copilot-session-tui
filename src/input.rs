@@ -816,7 +816,7 @@ pub(crate) fn handle_favorite_open(app: &mut App, key: KeyCode) {
             app.mode = Mode::Normal;
             if app.mux.is_none() {
                 app.status_message =
-                    Some("Panes need mux mode; restart CST with --mux".to_string());
+                    Some("Panes need the multiplexer; turn it on in settings (,)".to_string());
                 return;
             }
             app.status_message = Some(app.open_favorites_as_panes());
@@ -1724,13 +1724,8 @@ fn handle_settings(app: &mut App, key: KeyCode) {
                 SettingsEditField::WorktreeRoot,
                 app.config.worktree.root.to_string_lossy().to_string(),
             ),
-            6 => {
-                // The row reflects the persisted value; a `--mux` override only lasts
-                // for this invocation and must not be flipped by editing settings.
-                app.mux_on_disk = !app.mux_on_disk;
-                app.status_message =
-                    Some("Multiplexer setting applies the next time CST starts".to_string());
-            }
+            // The row shows the saved value, which a `--mux` override does not touch.
+            6 => app.set_mux_setting(!app.mux_on_disk),
             7 => begin_global_edit(
                 app,
                 SettingsEditField::MuxPrefix,
@@ -2745,7 +2740,10 @@ mod tests {
         handle_favorite_open(&mut app, KeyCode::Char('p'));
 
         assert_eq!(app.mode, Mode::Normal);
-        assert!(app.status_message.unwrap().contains("mux mode"));
+        let status = app.status_message.unwrap();
+        assert!(status.contains("multiplexer"));
+        // Turning it on no longer needs a restart, so telling the user to do one is wrong.
+        assert!(!status.contains("restart"));
     }
 
     #[test]

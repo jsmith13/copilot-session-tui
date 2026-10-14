@@ -339,8 +339,10 @@ says. Only a config without a `mux` key — a new install, or a file written by 
 the multiplexer by default.
 
 Toggle it from global settings (`,`), or override it for one invocation with `--mux` /
-`--no-mux`. The setting takes effect the next time CST starts; a CLI override is never
-written back to the config file.
+`--no-mux`. Toggling takes effect straight away, with one exception: turning it off while
+sessions are open in tabs waits until the last tab is closed, because those sessions run
+inside CST and would otherwise end with it. A CLI override is never written back to the
+config file, and toggling in settings replaces it for the rest of that run.
 
 While attached to a session, every keystroke goes to Copilot except the prefix key:
 
@@ -895,8 +897,9 @@ value and means autopilot never continues on its own.
 
 Running CST instances watch the global `config.json` and adopt changes made by another
 instance or an external editor without restarting. Notification routing and credentials
-are refreshed again immediately before each notification is queued. The current mux/non-mux mode remains
-fixed for the lifetime of a process, but a changed mux prefix takes effect live. Reload is
+are refreshed again immediately before each notification is queued. A changed mux prefix
+takes effect live, but a changed `mux` does not: each instance only switches mode when it is
+toggled in that instance's own settings, so one window never rearranges another. Reload is
 deferred while Global Settings is open so unsaved input is not overwritten; invalid JSON
 leaves the last known-good runtime configuration active and reports an error. A temporarily
 missing file is also ignored instead of resetting a running instance to defaults.
