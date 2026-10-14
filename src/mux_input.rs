@@ -7559,6 +7559,10 @@ fn main() {
                 }
             }
         }
+        // `n` asks whether to start as-is or in a worktree; the second `n` answers.
+        pane.send_key(&KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
+            .unwrap();
+        wait_for(&pane, &rx, "in the project as-is");
         pane.send_key(&KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
             .unwrap();
         wait_for(&pane, &rx, "FAKE COPILOT STARTED");
@@ -7596,11 +7600,13 @@ fn main() {
                 .map(|cell| cell.contents().to_string())
                 .unwrap_or_default()
         };
-        // The list behind is titled "Sessions" too, but follows it with more text.
+        // The list behind is titled "Sessions" too, and only sometimes follows it with
+        // more text, such as a workspace to recover. Its border is always at the left
+        // edge, where a centred popup never is.
         let heading = format!("┌ {title} ─");
         let width = heading.chars().count() as u16;
         let (top, left) = (0..rows).find_map(|row| {
-            (0..cols.saturating_sub(width)).find_map(|col| {
+            (1..cols.saturating_sub(width)).find_map(|col| {
                 let text: String = (col..col + width).map(|col| cell(row, col)).collect();
                 (text == heading).then_some((row, col))
             })
@@ -7899,6 +7905,11 @@ fn main() {
         show(&pane, "typed 'pay', pressed Delete");
 
         pane.send_key(&key(KeyCode::Esc)).unwrap();
+        // ESC followed at once by the prefix's 0x02 reads as one Alt+Ctrl+B, and the
+        // switcher never sees an Esc at all; no person types them that close together.
+        wait_until(&pane, &rx, "the switcher closed by Esc", |screen| {
+            popup_rows(screen, "Sessions").is_none()
+        });
         pane.send_key(&prefix).unwrap();
         pane.send_key(&key(KeyCode::Char('w'))).unwrap();
         wait_until(&pane, &rx, "two sessions left, unfiltered", |screen| {
