@@ -2346,6 +2346,15 @@ pub fn maybe_load_details(app: &mut App) {
 mod tests {
     use super::*;
 
+    /// CST as a launcher, which hands the terminal to Copilot. No longer the default, so
+    /// tests of what the launcher queues have to ask for it.
+    fn launcher_config() -> config::UserConfig {
+        config::UserConfig {
+            mux: false,
+            ..config::UserConfig::default()
+        }
+    }
+
     #[test]
     fn pasting_into_the_search_prompt_types_the_text() {
         let mut app = App::new(Vec::new(), config::UserConfig::default());
@@ -2730,7 +2739,7 @@ mod tests {
 
     #[test]
     fn choosing_panes_without_mux_says_so_instead_of_failing_silently() {
-        let mut app = App::new(Vec::new(), config::UserConfig::default());
+        let mut app = App::new(Vec::new(), launcher_config());
 
         handle_normal(&mut app, KeyCode::Char('T'));
         handle_favorite_open(&mut app, KeyCode::Char('p'));
@@ -2777,7 +2786,7 @@ mod tests {
     fn new_session_uses_cwd_project_without_a_filter() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir(temp.path().join(".git")).unwrap();
-        let mut app = App::new(Vec::new(), config::UserConfig::default());
+        let mut app = App::new(Vec::new(), launcher_config());
         app.set_cwd_context(temp.path().to_string_lossy().to_string(), false);
         assert!(app.project_filter.is_none());
 
@@ -2809,7 +2818,7 @@ mod tests {
             tool_call_count: 0,
             details_parsed_len: 0,
         };
-        let mut config = config::UserConfig::default();
+        let mut config = launcher_config();
         config.tmux_keys.resume_session = "a".to_string();
         let mut app = App::new(vec![session], config);
         app.tmux_support = crate::session::tmux::TmuxSupport::Available;
@@ -2839,7 +2848,7 @@ mod tests {
             .status()
             .unwrap()
             .success());
-        let mut config = config::UserConfig::default();
+        let mut config = launcher_config();
         config.worktree.root = temp.path().join("worktrees");
         let mut app = App::new(Vec::new(), config);
         app.tmux_support = crate::session::tmux::TmuxSupport::Available;
@@ -2981,7 +2990,7 @@ mod tests {
             .status()
             .unwrap()
             .success());
-        let mut config = config::UserConfig::default();
+        let mut config = launcher_config();
         config.worktree.root = temp.path().join("worktrees");
         let mut app = App::new(Vec::new(), config);
         app.disable_config_persistence();

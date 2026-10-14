@@ -34,7 +34,7 @@ A terminal user interface for managing GitHub Copilot CLI sessions. Browse, sear
 - **Session details** — preview edited files, last message, and session stats
 - **Resume** — press Enter to launch `copilot --resume` directly
 - **Isolated sessions** — press `N` to create a branch-backed Git worktree before launching Copilot
-- **Multiplexer** — optionally run sessions as panes inside CST, tmux-style, instead of handing over the terminal
+- **Multiplexer** — run sessions as panes inside CST, tmux-style, or turn it off to hand over the terminal instead
 - **Agent threads** — a session can take part in a GitHub issue, PR, or discussion, and be woken when somebody replies
 - **Rename** — rename sessions inline with `r`
 - **Safe cleanup** — delete TUI-created worktrees with dirty-worktree and unmerged-branch protection
@@ -322,10 +322,10 @@ When you resume a session, the TUI exits cleanly and launches `copilot --resume=
 
 ## Multiplexer
 
-By default CST is a launcher: it hands the terminal to Copilot and gets out of the way. Enable
-the multiplexer and it instead becomes a tmux-like host — sessions run in PTY-backed panes
-*inside* CST, so several can stay alive in a single terminal window and you can flip between
-them and the session list without ever leaving the TUI.
+By default CST is a tmux-like host: sessions run in PTY-backed panes *inside* CST, so several
+can stay alive in a single terminal window and you can flip between them and the session
+list without ever leaving the TUI. Turn the multiplexer off and CST is a launcher instead: it
+hands the terminal to Copilot and gets out of the way.
 
 ```json
 {
@@ -333,6 +333,10 @@ them and the session list without ever leaving the TUI.
   "mux_prefix": "C-b"
 }
 ```
+
+Every config CST has saved records `mux` explicitly, so upgrading keeps whichever mode it
+says. Only a config without a `mux` key — a new install, or a file written by hand — gets
+the multiplexer by default.
 
 Toggle it from global settings (`,`), or override it for one invocation with `--mux` /
 `--no-mux`. The setting takes effect the next time CST starts; a CLI override is never

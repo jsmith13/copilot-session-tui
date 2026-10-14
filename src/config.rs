@@ -165,7 +165,10 @@ pub struct UserConfig {
     pub github_comment_filter: GithubCommentFilter,
 
     /// Run sessions inside CST as multiplexed panes instead of launching and exiting.
-    #[serde(default)]
+    ///
+    /// Always written, even when it equals the default: configs saved while the default
+    /// was off record `false`, so those users keep the launcher they already had.
+    #[serde(default = "default_true")]
     pub mux: bool,
 
     /// Key that escapes back to CST while a pane is focused.
@@ -393,7 +396,7 @@ impl Default for UserConfig {
             hidden_title_prefixes: Vec::new(),
             hidden_path_prefixes: Vec::new(),
             github_comment_filter: GithubCommentFilter::All,
-            mux: false,
+            mux: true,
             mux_prefix: default_mux_prefix(),
             tmux_keys: TmuxKeyConfig::default(),
             worktree: WorktreeConfig::default(),
@@ -1355,6 +1358,22 @@ mod tests {
         assert!(!config.ntfy_verbose);
         assert!(config.notifications.ready);
         assert!(config.notifications.error);
+    }
+
+    #[test]
+    fn a_fresh_install_runs_sessions_inside_cst_but_a_saved_launcher_choice_is_kept() {
+        let fresh: UserConfig = serde_json::from_str("{}").unwrap();
+        assert!(fresh.mux);
+        assert!(UserConfig::default().mux);
+
+        // Every config written before the default flipped says `false` explicitly.
+        let existing: UserConfig = serde_json::from_str(r#"{"mux": false}"#).unwrap();
+        assert!(!existing.mux);
+
+        // Skipping the default on save would turn the next default change into a
+        // silent switch for everyone who had it on.
+        let saved = serde_json::to_value(UserConfig::default()).unwrap();
+        assert_eq!(saved["mux"], serde_json::Value::Bool(true));
     }
 
     #[test]
