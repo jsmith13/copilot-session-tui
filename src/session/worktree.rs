@@ -4,7 +4,7 @@ use fs4::{FileExt, TryLockError};
 use ignore::gitignore::GitignoreBuilder;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -29,22 +29,18 @@ pub struct ManagedWorktree {
     pub common_git_dir: PathBuf,
     pub branch: String,
     identity: String,
+    /// The `.worktreeinclude` the copies were made from. Nothing is recorded per copied
+    /// file: whether a copy changed is decided against its original in the source
+    /// repository, see [`included_files_are_dirty`]. Registries written by earlier
+    /// versions carry an `included_files` list with a hash per file; it is ignored on
+    /// load and dropped on the next save.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     include_patterns: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    included_files: Vec<IncludedFileState>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct IncludedFileState {
-    path: PathBuf,
-    sha256: String,
 }
 
 #[derive(Debug, Clone, Default)]
 struct WorktreeIncludeState {
     patterns: Option<String>,
-    files: Vec<IncludedFileState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -408,7 +404,6 @@ where
         branch: reservation.branch.clone(),
         identity: reservation.identity.clone(),
         include_patterns: included.patterns,
-        included_files: included.files,
     };
 
     if let Err(error) = finalize_creation_in(&reservation, &entry, registry_path) {
@@ -692,12 +687,11 @@ fn copy_worktree_includes_reporting(
                 destination.display()
             );
         }
-        candidates.push((relative.to_path_buf(), source, destination));
+        candidates.push((source, destination));
     }
 
     progress.plan_copies(candidates.len());
-    let mut copied = Vec::with_capacity(candidates.len());
-    for (relative, source, destination) in candidates {
+    for (copied, (source, destination)) in candidates.into_iter().enumerate() {
         if progress.is_cancelled() {
             bail!("Cancelled");
         }
@@ -716,15 +710,10 @@ fn copy_worktree_includes_reporting(
                 destination.display()
             )
         })?;
-        copied.push(IncludedFileState {
-            path: relative,
-            sha256: hash_file(&destination)?,
-        });
-        progress.note_copied(copied.len());
+        progress.note_copied(copied + 1);
     }
     Ok(WorktreeIncludeState {
         patterns: Some(patterns),
-        files: copied,
     })
 }
 
@@ -1371,38 +1360,17 @@ fn branch_is_checked_out(repository: &Path, branch: &str) -> Result<bool> {
     Ok(worktrees.lines().any(|line| line == branch_line))
 }
 
+/// Whether removing the worktree would lose work in the ignored files
+/// `.worktreeinclude` covers, which `git status` cannot see.
+///
+/// Each such file is compared with its original in the source repository rather than
+/// with a record taken at creation. A record meant hashing every copy as it was made,
+/// reading the whole include set twice, and a registry entry per file that every
+/// registry lock then parsed: a venv made one entry of 52,000 hashes. The cost of
+/// comparing with the source instead is that an original changed since is reported
+/// as a change too, which only asks for a confirmation that was not needed. A copy
+/// that was deleted is not reported: removing the worktree loses nothing it had not.
 fn included_files_are_dirty(entry: &ManagedWorktree) -> Result<bool> {
-    if entry.include_patterns.is_none() && entry.included_files.is_empty() {
-        return Ok(false);
-    }
-
-    let tracked_output = git_output(&entry.path, ["ls-files", "-z", "--"])?;
-    if !tracked_output.status.success() {
-        bail!(
-            "Failed to enumerate tracked worktree files: {}",
-            command_error(&tracked_output)
-        );
-    }
-    let tracked: HashSet<String> = nul_paths(&tracked_output.stdout)?
-        .into_iter()
-        .map(|path| relative_path_key(&path))
-        .collect();
-    let initial: HashMap<String, &IncludedFileState> = entry
-        .included_files
-        .iter()
-        .map(|state| (relative_path_key(&state.path), state))
-        .collect();
-
-    for state in &entry.included_files {
-        if tracked.contains(&relative_path_key(&state.path)) {
-            continue;
-        }
-        let path = entry.path.join(&state.path);
-        if !path.is_file() || hash_file(&path)? != state.sha256 {
-            return Ok(true);
-        }
-    }
-
     let Some(patterns) = entry.include_patterns.as_deref() else {
         return Ok(false);
     };
@@ -1432,12 +1400,73 @@ fn included_files_are_dirty(entry: &ManagedWorktree) -> Result<bool> {
         if matcher
             .matched_path_or_any_parents(&path, false)
             .is_ignore()
-            && !initial.contains_key(&relative_path_key(&path))
+            && !matches_original(
+                &entry.path.join(&path),
+                &entry.source_repository.join(&path),
+            )?
         {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+/// Whether `copy` still holds what `original` does. Equal size and modification time
+/// settle it without reading either: Windows keeps the time when copying, and any
+/// write to the copy moves it. Elsewhere the copy is stamped with the time it was
+/// made, so it falls through to comparing contents, as does a copy written back to
+/// what it was.
+fn matches_original(copy: &Path, original: &Path) -> Result<bool> {
+    let Ok(original_metadata) = fs::metadata(original) else {
+        return Ok(false);
+    };
+    let copy_metadata = fs::metadata(copy)
+        .with_context(|| format!("Failed to inspect included file: {}", copy.display()))?;
+    if !original_metadata.is_file() || copy_metadata.len() != original_metadata.len() {
+        return Ok(false);
+    }
+    if let (Ok(copied), Ok(originally)) = (copy_metadata.modified(), original_metadata.modified()) {
+        if copied == originally {
+            return Ok(true);
+        }
+    }
+    same_contents(copy, original)
+}
+
+fn same_contents(left: &Path, right: &Path) -> Result<bool> {
+    let open = |path: &Path| {
+        File::open(path)
+            .with_context(|| format!("Failed to read included file: {}", path.display()))
+    };
+    let (mut left_file, mut right_file) = (open(left)?, open(right)?);
+    let mut left_buffer = vec![0_u8; 64 * 1024];
+    let mut right_buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let left_read = read_full(&mut left_file, &mut left_buffer, left)?;
+        let right_read = read_full(&mut right_file, &mut right_buffer, right)?;
+        if left_buffer[..left_read] != right_buffer[..right_read] {
+            return Ok(false);
+        }
+        if left_read == 0 {
+            return Ok(true);
+        }
+    }
+}
+
+/// Fills `buffer` unless the file ends first, so two files are compared in step even
+/// when the OS hands back short reads.
+fn read_full(file: &mut File, buffer: &mut [u8], path: &Path) -> Result<usize> {
+    let mut filled = 0;
+    while filled < buffer.len() {
+        let read = file
+            .read(&mut buffer[filled..])
+            .with_context(|| format!("Failed to read included file: {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        filled += read;
+    }
+    Ok(filled)
 }
 
 fn nul_paths(output: &[u8]) -> Result<Vec<PathBuf>> {
@@ -1459,23 +1488,6 @@ fn relative_path_key(path: &Path) -> String {
     } else {
         value
     }
-}
-
-fn hash_file(path: &Path) -> Result<String> {
-    let mut file = File::open(path)
-        .with_context(|| format!("Failed to read included file: {}", path.display()))?;
-    let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .with_context(|| format!("Failed to hash included file: {}", path.display()))?;
-        if read == 0 {
-            break;
-        }
-        digest.update(&buffer[..read]);
-    }
-    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn registry_version() -> u32 {
@@ -1921,7 +1933,6 @@ mod tests {
             branch: "stale".to_string(),
             identity: "stale-identity".to_string(),
             include_patterns: None,
-            included_files: Vec::new(),
         };
         save_registry(
             &registry_path,
@@ -2018,7 +2029,6 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(entry.included_files.len(), 1);
         assert!(!is_dirty(&entry).unwrap());
 
         fs::write(entry.path.join(".env"), "changed").unwrap();
@@ -2029,6 +2039,72 @@ mod tests {
         fs::create_dir_all(entry.path.join("cache")).unwrap();
         fs::write(entry.path.join("cache").join("new.txt"), "new").unwrap();
         assert!(is_dirty(&entry).unwrap());
+    }
+
+    /// The size check alone would miss this, and the modification time is what
+    /// lets an untouched copy skip reading its contents, so it must not be trusted to
+    /// mean "unchanged" once the copy has been written to.
+    #[test]
+    fn an_included_file_edited_to_the_same_size_counts_as_a_change() {
+        let (_repo, _temp, entry) = worktree_with_included_env();
+
+        fs::write(entry.path.join(".env"), "secreT").unwrap();
+
+        assert!(is_dirty(&entry).unwrap());
+    }
+
+    /// Removing the worktree cannot lose anything a deleted copy still had, and
+    /// knowing a copy was deleted would need the per-file record this check exists
+    /// to avoid keeping.
+    #[test]
+    fn a_deleted_included_file_does_not_block_removal() {
+        let (_repo, _temp, entry) = worktree_with_included_env();
+
+        fs::remove_file(entry.path.join(".env")).unwrap();
+
+        assert!(!is_dirty(&entry).unwrap());
+    }
+
+    /// Registries written before carried a hash for every included file; one venv
+    /// made a single entry of 52,000 of them, parsed on every registry lock.
+    #[test]
+    fn a_registry_with_per_file_hashes_still_loads_and_sheds_them_when_saved() {
+        let (_repo, temp, entry) = worktree_with_included_env();
+        let registry_path = temp.path().join("registry.json");
+        let mut written: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&registry_path).unwrap()).unwrap();
+        written["worktrees"][0]["included_files"] =
+            serde_json::json!([{ "path": ".env", "sha256": "0".repeat(64) }]);
+        fs::write(&registry_path, written.to_string()).unwrap();
+
+        let registry = load_registry(&registry_path).unwrap();
+        assert_eq!(registry.worktrees, vec![entry]);
+        save_registry(&registry_path, &registry).unwrap();
+
+        assert!(!fs::read_to_string(&registry_path)
+            .unwrap()
+            .contains("included_files"));
+    }
+
+    fn worktree_with_included_env() -> (tempfile::TempDir, tempfile::TempDir, ManagedWorktree) {
+        let repo = repository();
+        let temp = tempfile::tempdir().unwrap();
+        let registry = temp.path().join("registry.json");
+        fs::write(repo.path().join(".gitignore"), ".env\n").unwrap();
+        fs::write(repo.path().join(".worktreeinclude"), ".env\n").unwrap();
+        git(repo.path(), &["add", ".gitignore", ".worktreeinclude"]);
+        git(repo.path(), &["commit", "-m", "add worktree includes"]);
+        fs::write(repo.path().join(".env"), "secret").unwrap();
+        let created = create_managed_worktree_with(
+            repo.path(),
+            "copilot/includes",
+            &test_config(&temp),
+            &registry,
+            copy_worktree_includes,
+        )
+        .unwrap();
+        assert!(!is_dirty(&created.entry).unwrap());
+        (repo, temp, created.entry)
     }
 
     #[test]
