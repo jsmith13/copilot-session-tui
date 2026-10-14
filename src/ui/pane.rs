@@ -2372,6 +2372,7 @@ mod tests {
             pane: 1,
             branch: "feature".to_string(),
             progress,
+            favorite: false,
         });
 
         let text = render_buffer(&mut app, 120, 24)

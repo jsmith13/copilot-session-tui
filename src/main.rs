@@ -615,10 +615,10 @@ fn main() -> Result<()> {
     // Start new session if requested
     if let Some(request) = app.should_new_session.take() {
         match request {
-            NewSessionRequest::Normal { cwd } => {
+            NewSessionRequest::Normal { cwd, session_id } => {
                 eprintln!("Starting new session in {}...", &cwd);
                 last_dir = Some(cwd.clone());
-                manager::start_new_session(&cwd, &app.config)?;
+                manager::start_new_session(&cwd, &app.config, &session_id)?;
             }
             NewSessionRequest::Tmux { cwd, title } => {
                 eprintln!("Starting persistent tmux session in {}...", cwd);
@@ -648,12 +648,14 @@ fn main() -> Result<()> {
                 source_project,
                 branch,
                 config,
+                session_id,
             } => {
                 let worktree = manager::start_worktree_session(
                     &source_project,
                     &branch,
                     &config,
                     &app.config,
+                    &session_id,
                 )?;
                 last_dir = Some(worktree.to_string_lossy().to_string());
             }
@@ -2110,6 +2112,7 @@ mod tests {
         let mut creating = ready_app();
         creating.should_new_session = Some(NewSessionRequest::Normal {
             cwd: "cwd".to_string(),
+            session_id: "session-1".to_string(),
         });
         assert!(prioritize_explicit_exit(&mut creating));
         assert!(creating.restart_after_update.is_none());

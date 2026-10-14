@@ -1147,17 +1147,21 @@ fn begin_new_session_choice(app: &mut App) {
             Some("Filter by a project first (f) to start a new session".to_string());
         return;
     }
+    app.new_session_favorite = false;
     app.mode = Mode::NewSessionKind;
 }
 
 pub(crate) fn handle_new_session_kind(app: &mut App, key: KeyCode) {
     match key {
+        // Space, because that is what stars a session in the list.
+        KeyCode::Char(' ') => app.new_session_favorite = !app.new_session_favorite,
         KeyCode::Char('n') | KeyCode::Enter => {
             app.mode = Mode::Normal;
             start_plain_new_session(app);
             // Spawning took it if it worked. If not, it must not linger and pull the
             // next, unrelated new session into a split.
             app.new_split = None;
+            app.new_session_favorite = false;
         }
         KeyCode::Char('w') | KeyCode::Char('W') => {
             app.mode = Mode::Normal;
@@ -1165,10 +1169,12 @@ pub(crate) fn handle_new_session_kind(app: &mut App, key: KeyCode) {
             // Kept only while the branch name is being asked for.
             if app.mode != Mode::BranchName {
                 app.new_split = None;
+                app.new_session_favorite = false;
             }
         }
         KeyCode::Esc | KeyCode::Char('q') => {
             app.new_split = None;
+            app.new_session_favorite = false;
             app.mode = Mode::Normal;
         }
         _ => {}
@@ -1181,14 +1187,36 @@ fn start_plain_new_session(app: &mut App) {
             Some("Filter by a project first (f) to start a new session".to_string());
         return;
     };
+    let favorite = app.new_session_favorite;
     if app.mux_enabled() {
         let title = project_title(&cwd);
         match app.attach_new_session(&cwd, title) {
-            Ok(()) => crate::mux_input::sync_workspace_panels(app),
+            Ok(session_id) => {
+                crate::mux_input::sync_workspace_panels(app);
+                if favorite {
+                    let outcome = favorite_new_session(app, &session_id);
+                    app.status_message = Some(format!("Started new session{outcome}"));
+                }
+            }
             Err(error) => app.status_message = Some(format!("Cannot start session: {error}")),
         }
     } else {
-        app.should_new_session = Some(NewSessionRequest::Normal { cwd });
+        let session_id = manager::new_session_id();
+        if favorite {
+            // Nobody will read this once CST hands over the terminal, but a failed save
+            // is no reason to refuse the session that was asked for.
+            let outcome = favorite_new_session(app, &session_id);
+            app.status_message = Some(format!("Starting new session{outcome}"));
+        }
+        app.should_new_session = Some(NewSessionRequest::Normal { cwd, session_id });
+    }
+}
+
+/// Make a session that is starting a favorite, as a suffix for the message saying so.
+fn favorite_new_session(app: &mut App, session_id: &str) -> String {
+    match app.add_favorite(session_id) {
+        Ok(()) => "; added to favorites".to_string(),
+        Err(error) => format!("; could not add it to favorites: {error}"),
     }
 }
 
@@ -1458,6 +1486,7 @@ pub(crate) fn handle_filter_project(app: &mut App, key: KeyCode) {
                     new_split.project = Some(project);
                 }
                 // Then the same question `n` asks: as-is, or in a new worktree.
+                app.new_session_favorite = false;
                 app.mode = Mode::NewSessionKind;
                 return;
             }
@@ -2074,6 +2103,7 @@ pub fn finish_worktree_launch(app: &mut App, pane: PaneId, outcome: WorktreeOutc
     };
     let preparing = app.preparing_worktrees.remove(index);
     let branch = preparing.branch;
+    let favorite = preparing.favorite;
     let created = match outcome.created {
         Ok(created) => created,
         Err(_) if preparing.progress.is_cancelled() => {
@@ -2122,7 +2152,11 @@ pub fn finish_worktree_launch(app: &mut App, pane: PaneId, outcome: WorktreeOutc
     let path = created.entry.path.clone();
     match outcome.tmux {
         None => match app.launch_new_session_in(pane, &path) {
-            Ok(()) => app.status_message = Some(format!("Isolated session on '{branch}'{notice}")),
+            Ok(()) => {
+                let favorited = favorite_launched_tab(app, pane, favorite);
+                app.status_message =
+                    Some(format!("Isolated session on '{branch}'{favorited}{notice}"));
+            }
             Err(error) => {
                 // The worktree exists but has no session; undo it rather than leaking one.
                 close_unlaunched_tab(app, pane);
@@ -2138,7 +2172,10 @@ pub fn finish_worktree_launch(app: &mut App, pane: PaneId, outcome: WorktreeOutc
             app.track_external_session(launched.session_id.clone());
             let base = format!("Started '{branch}' in tmux '{}'", launched.tmux_session);
             app.status_message = Some(match app.launch_tmux_in(pane, launched) {
-                Ok(()) => format!("{base}; opened as a CST tab{notice}"),
+                Ok(()) => {
+                    let favorited = favorite_launched_tab(app, pane, favorite);
+                    format!("{base}; opened as a CST tab{favorited}{notice}")
+                }
                 Err(error) => {
                     close_unlaunched_tab(app, pane);
                     format!("{base}; could not open CST tab: {error}{notice}")
@@ -2154,6 +2191,22 @@ pub fn finish_worktree_launch(app: &mut App, pane: PaneId, outcome: WorktreeOutc
                 ),
             });
         }
+    }
+}
+
+/// Make the session that just started in a tab a favorite, if it was created as one.
+///
+/// Only once it has started: a worktree that failed or was called off leaves no
+/// favorite behind pointing at a session that will never exist.
+fn favorite_launched_tab(app: &mut App, pane: PaneId, favorite: bool) -> String {
+    let session_id = app
+        .mux
+        .as_ref()
+        .and_then(|mux| mux.pane(pane))
+        .map(|pane| pane.session_id.clone());
+    match session_id {
+        Some(session_id) if favorite => favorite_new_session(app, &session_id),
+        _ => String::new(),
     }
 }
 
@@ -2175,12 +2228,14 @@ fn handle_branch_name(app: &mut App, key: KeyCode) {
             app.branch_config = None;
             app.worktree_launch_target = WorktreeLaunchTarget::Standard;
             app.new_split = None;
+            app.new_session_favorite = false;
             app.mode = Mode::Normal;
             app.status_message = Some("Isolated session cancelled".to_string());
         }
         KeyCode::Enter => {
             let Some(project) = app.command_project() else {
                 app.worktree_launch_target = WorktreeLaunchTarget::Standard;
+                app.new_session_favorite = false;
                 app.mode = Mode::Normal;
                 app.status_message = Some("Project context is no longer available".to_string());
                 return;
@@ -2191,6 +2246,7 @@ fn handle_branch_name(app: &mut App, key: KeyCode) {
             }
             let Some(config) = app.branch_config.clone() else {
                 app.worktree_launch_target = WorktreeLaunchTarget::Standard;
+                app.new_session_favorite = false;
                 app.mode = Mode::Normal;
                 app.status_message = Some("Worktree configuration is unavailable".to_string());
                 return;
@@ -2210,14 +2266,23 @@ fn handle_branch_name(app: &mut App, key: KeyCode) {
                 // Joined by the tab just opened, or not at all; either way it must not
                 // carry over to the next new session.
                 app.new_split = None;
+                app.new_session_favorite = false;
                 return;
             }
             app.should_new_session = Some(match target {
-                WorktreeLaunchTarget::Standard => NewSessionRequest::Worktree {
-                    source_project: project,
-                    branch: app.branch_input.clone(),
-                    config,
-                },
+                WorktreeLaunchTarget::Standard => {
+                    let session_id = manager::new_session_id();
+                    if std::mem::take(&mut app.new_session_favorite) {
+                        let outcome = favorite_new_session(app, &session_id);
+                        app.status_message = Some(format!("Starting isolated session{outcome}"));
+                    }
+                    NewSessionRequest::Worktree {
+                        source_project: project,
+                        branch: app.branch_input.clone(),
+                        config,
+                        session_id,
+                    }
+                }
                 WorktreeLaunchTarget::Tmux => NewSessionRequest::TmuxWorktree {
                     source_project: project,
                     branch: app.branch_input.clone(),
@@ -2720,7 +2785,7 @@ mod tests {
         handle_new_session_kind(&mut app, KeyCode::Char('n'));
 
         match app.should_new_session {
-            Some(NewSessionRequest::Normal { ref cwd }) => {
+            Some(NewSessionRequest::Normal { ref cwd, .. }) => {
                 assert_eq!(cwd, app.cwd_project.as_ref().unwrap());
             }
             other => panic!("expected a normal new session request, got {other:?}"),
@@ -2907,6 +2972,121 @@ mod tests {
             app.mode, app.status_message
         );
         assert!(app.should_new_session.is_none());
+    }
+
+    fn app_in_git_repository(temp: &tempfile::TempDir) -> App {
+        assert!(std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(temp.path())
+            .status()
+            .unwrap()
+            .success());
+        let mut config = config::UserConfig::default();
+        config.worktree.root = temp.path().join("worktrees");
+        let mut app = App::new(Vec::new(), config);
+        app.disable_config_persistence();
+        app.set_cwd_context(temp.path().to_string_lossy().to_string(), false);
+        app
+    }
+
+    #[test]
+    fn starring_a_new_session_favorites_the_id_it_is_launched_with_so_it_is_never_a_guess() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = app_in_git_repository(&temp);
+
+        handle_normal(&mut app, KeyCode::Char('n'));
+        handle_new_session_kind(&mut app, KeyCode::Char(' '));
+        handle_new_session_kind(&mut app, KeyCode::Char('n'));
+
+        let Some(NewSessionRequest::Normal { session_id, .. }) = app.should_new_session.as_ref()
+        else {
+            panic!(
+                "expected a normal request, got {:?}",
+                app.should_new_session
+            );
+        };
+        assert_eq!(app.config.favorites, vec![session_id.clone()]);
+        assert!(
+            !app.new_session_favorite,
+            "the next new session starts unstarred"
+        );
+    }
+
+    #[test]
+    fn a_new_session_is_only_a_favorite_when_asked_for() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = app_in_git_repository(&temp);
+
+        handle_normal(&mut app, KeyCode::Char('n'));
+        handle_new_session_kind(&mut app, KeyCode::Char(' '));
+        handle_new_session_kind(&mut app, KeyCode::Char(' '));
+        handle_new_session_kind(&mut app, KeyCode::Char('n'));
+
+        assert!(app.should_new_session.is_some());
+        assert!(app.config.favorites.is_empty());
+    }
+
+    #[test]
+    fn cancelling_a_starred_new_session_favorites_nothing_and_forgets_the_star() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = app_in_git_repository(&temp);
+
+        handle_normal(&mut app, KeyCode::Char('n'));
+        handle_new_session_kind(&mut app, KeyCode::Char(' '));
+        handle_new_session_kind(&mut app, KeyCode::Esc);
+
+        assert!(app.should_new_session.is_none());
+        assert!(app.config.favorites.is_empty());
+        assert!(!app.new_session_favorite);
+    }
+
+    #[test]
+    fn a_starred_worktree_session_is_favorited_under_the_id_it_is_launched_with() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = app_in_git_repository(&temp);
+
+        handle_normal(&mut app, KeyCode::Char('n'));
+        handle_new_session_kind(&mut app, KeyCode::Char(' '));
+        handle_new_session_kind(&mut app, KeyCode::Char('w'));
+        assert_eq!(app.mode, Mode::BranchName);
+        assert!(
+            app.config.favorites.is_empty(),
+            "nothing is favorited before the branch is even named"
+        );
+
+        app.branch_input = "copilot/starred".to_string();
+        handle_branch_name(&mut app, KeyCode::Enter);
+
+        let Some(NewSessionRequest::Worktree { session_id, .. }) = app.should_new_session.as_ref()
+        else {
+            panic!(
+                "expected a worktree request, got {:?}",
+                app.should_new_session
+            );
+        };
+        assert_eq!(app.config.favorites, vec![session_id.clone()]);
+        assert!(!app.new_session_favorite);
+    }
+
+    #[test]
+    fn leaving_the_branch_name_drops_the_star_so_the_next_worktree_is_not_a_favorite() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = app_in_git_repository(&temp);
+
+        handle_normal(&mut app, KeyCode::Char('n'));
+        handle_new_session_kind(&mut app, KeyCode::Char(' '));
+        handle_new_session_kind(&mut app, KeyCode::Char('w'));
+        handle_branch_name(&mut app, KeyCode::Esc);
+        assert!(!app.new_session_favorite);
+
+        // `N` goes straight to the branch name without the question that stars it.
+        handle_normal(&mut app, KeyCode::Char('N'));
+        assert_eq!(app.mode, Mode::BranchName);
+        app.branch_input = "copilot/plain".to_string();
+        handle_branch_name(&mut app, KeyCode::Enter);
+
+        assert!(app.should_new_session.is_some());
+        assert!(app.config.favorites.is_empty());
     }
 
     #[test]
@@ -3338,6 +3518,7 @@ mod tests {
             pane: id,
             branch: branch.to_string(),
             progress: std::sync::Arc::clone(&progress),
+            favorite: false,
         });
         (app, id, progress)
     }
