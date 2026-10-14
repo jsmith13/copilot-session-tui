@@ -959,6 +959,7 @@ pub fn draw_help(f: &mut Frame, app: &mut App) {
         Line::from(""),
         help_section(theme, "Favorites"),
         help_line(theme, "Space", "Toggle selected session favorite"),
+        help_line(theme, "n Space", "Start a new session as a favorite"),
         help_line(theme, "g", "Grab a favorite, then ↑/↓ to reorder"),
         help_line(theme, "T", "Open favorites as panes or terminal tabs"),
         help_line(theme, "R", "Recover the tabs of a closed or crashed CST"),
@@ -2397,7 +2398,8 @@ pub fn draw_favorite_open(f: &mut Frame, app: &App) {
 /// Asks whether a new session should run in the project as-is or in a worktree.
 pub fn draw_new_session_kind(f: &mut Frame, app: &App) {
     let theme = app.theme();
-    let area = centered_rect(58, 38, f.area());
+    // Tall enough that a 24-row terminal still shows the last line, Esc.
+    let area = centered_rect(58, 46, f.area());
     prepare_popup(f, area, theme);
     let block = Block::default()
         .title(" New Session ")
@@ -2430,6 +2432,21 @@ pub fn draw_new_session_kind(f: &mut Frame, app: &App) {
         Line::from(""),
         choice("n", "here, in the project as-is (Enter too)"),
         choice("w", "in a new isolated Git worktree"),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "Space",
+                Style::default()
+                    .fg(theme.accent_alt)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(if app.new_session_favorite {
+                "  [x] add it to favorites"
+            } else {
+                "  [ ] add it to favorites"
+            }),
+        ]),
         Line::from(""),
         Line::from(vec![
             Span::raw("  "),
@@ -2908,5 +2925,22 @@ mod help_tests {
             (settings_area.left()..settings_area.right())
                 .all(|x| settings[(x, y)].bg != Color::Reset)
         }));
+    }
+
+    #[test]
+    fn the_new_session_question_shows_whether_it_will_be_a_favorite_and_still_fits_24_rows() {
+        let mut app = App::new(Vec::new(), UserConfig::default());
+        let render = |app: &App| {
+            let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+            terminal.draw(|f| draw_new_session_kind(f, app)).unwrap();
+            buffer_text(terminal.backend().buffer())
+        };
+
+        let unchecked = render(&app);
+        assert!(unchecked.contains("[ ] add it to favorites"));
+        assert!(unchecked.contains("Esc"), "the way out must not be cut off");
+
+        app.new_session_favorite = true;
+        assert!(render(&app).contains("[x] add it to favorites"));
     }
 }

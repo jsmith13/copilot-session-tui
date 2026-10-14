@@ -260,15 +260,16 @@ pub fn resume_session(session_id: &str, cwd: &str, config: &UserConfig) -> Resul
     Ok(())
 }
 
-/// Start a new session by launching `copilot` in the given working directory
-pub fn start_new_session(cwd: &str, config: &UserConfig) -> Result<()> {
+/// Start a new session by launching `copilot` in the given working directory, under an
+/// id chosen earlier with [`new_session_id`].
+pub fn start_new_session(cwd: &str, config: &UserConfig, session_id: &str) -> Result<()> {
     let copilot = find_copilot()?;
 
     let mut cmd = Command::new(copilot);
     let cwd_path = Path::new(cwd);
     apply_args(
         &mut cmd,
-        new_session_config_args(config, &LaunchPolicy::resolve(config, cwd_path)),
+        new_session_args_for(config, &LaunchPolicy::resolve(config, cwd_path), session_id),
     );
     if cwd_path.exists() {
         cmd.current_dir(cwd_path);
@@ -315,6 +316,7 @@ pub fn start_worktree_session(
     branch: &str,
     worktree_config: &EffectiveWorktreeConfig,
     config: &UserConfig,
+    session_id: &str,
 ) -> Result<PathBuf> {
     let copilot = find_copilot()?;
     let created = worktree::create_managed_worktree(Path::new(project), branch, worktree_config)?;
@@ -332,7 +334,7 @@ pub fn start_worktree_session(
     // The worktree carries the repository's own `.cst.json`, so it answers for the
     // project setting exactly as the main checkout would.
     let policy = LaunchPolicy::resolve(config, &created.entry.path);
-    apply_args(&mut cmd, new_session_config_args(config, &policy));
+    apply_args(&mut cmd, new_session_args_for(config, &policy, session_id));
     cmd.current_dir(&created.entry.path);
 
     if let Err(error) = cmd.status() {

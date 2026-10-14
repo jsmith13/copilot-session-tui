@@ -192,8 +192,11 @@ pub enum SortField {
 
 #[derive(Debug, Clone)]
 pub enum NewSessionRequest {
+    // Chosen before CST hands over the terminal, so the session can be made a favorite
+    // while there is still a CST to write the config.
     Normal {
         cwd: String,
+        session_id: String,
     },
     Tmux {
         cwd: String,
@@ -208,6 +211,7 @@ pub enum NewSessionRequest {
         source_project: String,
         branch: String,
         config: EffectiveWorktreeConfig,
+        session_id: String,
     },
     TmuxWorktree {
         source_project: String,
@@ -229,6 +233,9 @@ pub struct PreparingWorktree {
     pub pane: crate::mux::PaneId,
     pub branch: String,
     pub progress: Arc<CreationProgress>,
+    /// Make the session a favorite once it starts; a worktree that never gets one
+    /// leaves nothing behind in the favorites.
+    pub favorite: bool,
 }
 
 /// What the thread behind a [`PreparingWorktree`] sends back.
@@ -883,6 +890,10 @@ pub struct App {
     /// A session being started from the split picker, to open beside `anchor`
     /// rather than in a tab of its own. Cleared whenever that flow is left.
     pub new_split: Option<NewSplit>,
+    /// The session being started should be a favorite from the start. Lives as long as
+    /// `new_split` does: the new-session question and, for a worktree, the branch name
+    /// that follows it.
+    pub new_session_favorite: bool,
     /// When this instance started; with the pid, what its workspace record is named by.
     pub instance_started_at: chrono::DateTime<chrono::Utc>,
     /// Where workspace records are kept, or `None` to keep none (tests).
@@ -1068,6 +1079,7 @@ impl App {
             pane_filter: String::new(),
             split_picker: None,
             new_split: None,
+            new_session_favorite: false,
             instance_started_at: chrono::Utc::now(),
             // Never the real state directory from a test.
             workspace_record_root: (!cfg!(test)).then(crate::recovery::root),
@@ -3627,26 +3639,38 @@ impl App {
         let Some(session_id) = self.selected_session().map(|session| session.id.clone()) else {
             return Ok(None);
         };
-        let previous = self.config.favorites.clone();
         let was_favorite = self.is_favorite(&session_id);
 
         if was_favorite {
+            let previous = self.config.favorites.clone();
             self.config.favorites.retain(|id| id != &session_id);
+            if let Err(error) = self.save_config() {
+                self.config.favorites = previous;
+                return Err(error);
+            }
         } else {
-            // New favorites land at the end so starring one never silently
-            // rearranges the order the user already set.
-            self.config.favorites.push(session_id.clone());
-        }
-
-        if let Err(error) = self.save_config() {
-            self.config.favorites = previous;
-            return Err(error);
+            self.add_favorite(&session_id)?;
         }
 
         self.apply_filter();
         self.focus_session(&session_id);
 
         Ok(Some(!was_favorite))
+    }
+
+    /// Make a session a favorite, whether or not Copilot has written it to disk yet.
+    pub fn add_favorite(&mut self, session_id: &str) -> anyhow::Result<()> {
+        if self.is_favorite(session_id) {
+            return Ok(());
+        }
+        // New favorites land at the end so starring one never silently rearranges the
+        // order the user already set.
+        self.config.favorites.push(session_id.to_string());
+        if let Err(error) = self.save_config() {
+            self.config.favorites.pop();
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn forget_favorite(&mut self, session_id: &str) -> anyhow::Result<bool> {
@@ -4220,11 +4244,12 @@ impl App {
         }
     }
 
-    /// Start a brand new Copilot session as a pane.
-    pub fn attach_new_session(&mut self, cwd: &str, title: String) -> Result<()> {
+    /// Start a brand new Copilot session as a pane, returning the id it was given.
+    pub fn attach_new_session(&mut self, cwd: &str, title: String) -> Result<String> {
         let (program, args, session_id) =
             manager::new_session_command(&self.config, Path::new(cwd))?;
-        self.spawn_pane(title, PathBuf::from(cwd), session_id, program, args)
+        self.spawn_pane(title, PathBuf::from(cwd), session_id.clone(), program, args)?;
+        Ok(session_id)
     }
 
     pub fn attach_tmux_session(&mut self, reference: TmuxSessionRef, title: String) -> Result<()> {
@@ -4332,6 +4357,8 @@ impl App {
             pane: id,
             branch: branch.clone(),
             progress: Arc::clone(&progress),
+            // Taken like the pending split: it belongs to this tab now, not the next.
+            favorite: std::mem::take(&mut self.new_session_favorite),
         });
         std::thread::spawn(move || {
             let created = worktree::create_managed_worktree_reporting(
