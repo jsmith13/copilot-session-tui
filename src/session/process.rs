@@ -1,7 +1,12 @@
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+// Linux waits on a pidfd with poll timeouts instead of sleeping against a deadline, and
+// only Windows converts process creation times, so a Linux build uses neither.
+#[cfg(not(target_os = "linux"))]
+use std::time::Duration;
+#[cfg(windows)]
+use std::time::SystemTime;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionOwner {
