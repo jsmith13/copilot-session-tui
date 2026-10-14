@@ -119,18 +119,46 @@ pub fn new_session_command(
     config: &UserConfig,
     cwd: &Path,
 ) -> Result<(String, Vec<String>, String)> {
-    let copilot = find_copilot()?;
-    let (args, session_id) = new_session_args(config, &LaunchPolicy::resolve(config, cwd));
+    let session_id = new_session_id();
+    let (copilot, args) = new_session_command_for(config, cwd, &session_id)?;
     Ok((copilot, args, session_id))
+}
+
+/// An id for a session that does not exist yet, for when its tab opens before it can.
+pub fn new_session_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// [`new_session_command`] for an id chosen earlier with [`new_session_id`].
+pub fn new_session_command_for(
+    config: &UserConfig,
+    cwd: &Path,
+    session_id: &str,
+) -> Result<(String, Vec<String>)> {
+    let copilot = find_copilot()?;
+    let args = new_session_args_for(config, &LaunchPolicy::resolve(config, cwd), session_id);
+    Ok((copilot, args))
 }
 
 /// The argument half of [`new_session_command`], split out so it can be tested without
 /// a Copilot binary on PATH.
+#[cfg(test)]
 fn new_session_args(config: &UserConfig, policy: &LaunchPolicy) -> (Vec<String>, String) {
-    let session_id = uuid::Uuid::new_v4().to_string();
+    let session_id = new_session_id();
+    (
+        new_session_args_for(config, policy, &session_id),
+        session_id,
+    )
+}
+
+fn new_session_args_for(
+    config: &UserConfig,
+    policy: &LaunchPolicy,
+    session_id: &str,
+) -> Vec<String> {
     let mut args = vec![format!("--session-id={session_id}")];
     args.extend(new_session_config_args(config, policy));
-    (args, session_id)
+    args
 }
 
 /// Rename a session using the current `name` field while preserving legacy metadata.
@@ -253,8 +281,18 @@ pub fn start_new_session(cwd: &str, config: &UserConfig) -> Result<()> {
 
 /// Start a new Copilot conversation owned by a persistent tmux session.
 pub fn start_tmux_session(cwd: &Path, title: &str, config: &UserConfig) -> Result<TmuxSessionRef> {
-    let (program, args, session_id) = new_session_command(config, cwd)?;
-    tmux::launch(cwd, title, &program, &args, &session_id)
+    start_tmux_session_for(cwd, title, config, &new_session_id())
+}
+
+/// [`start_tmux_session`] for an id chosen earlier with [`new_session_id`].
+pub fn start_tmux_session_for(
+    cwd: &Path,
+    title: &str,
+    config: &UserConfig,
+    session_id: &str,
+) -> Result<TmuxSessionRef> {
+    let (program, args) = new_session_command_for(config, cwd, session_id)?;
+    tmux::launch(cwd, title, &program, &args, session_id)
 }
 
 /// Resume an existing Copilot conversation owned by a persistent tmux session.

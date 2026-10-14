@@ -2772,6 +2772,10 @@ pub fn handle_mux_event(app: &mut App, event: MuxEvent) -> bool {
                 || title_changed
                 || notification_changed
         }
+        MuxEvent::WorktreeReady(id, outcome) => {
+            crate::input::finish_worktree_launch(app, id, *outcome);
+            true
+        }
         MuxEvent::Exited(id, code) => {
             let was_focused = app.mux.as_ref().is_some_and(|mux| mux.focused == Some(id));
             // A tab the user just closed reports its process exiting a moment later.

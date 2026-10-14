@@ -1,11 +1,11 @@
 use crate::config::{self, EffectiveWorktreeConfig, ProjectSettings, UserConfig};
 use crate::github::{GithubError, GithubItem};
-use crate::mux::{KeyChord, MuxState, Pane, PaneSpec, PrefixState};
+use crate::mux::{KeyChord, MuxEvent, MuxState, Pane, PaneLaunch, PaneSpec, PrefixState};
 use crate::notifications::{NotificationKind, NotificationRequest, NotificationWorker};
 use crate::scratchpad::Scratchpad;
 use crate::session::manager;
 use crate::session::tmux::{self, TmuxSessionRef, TmuxSupport};
-use crate::session::worktree::ManagedWorktree;
+use crate::session::worktree::{self, CreatedWorktree, CreationProgress, ManagedWorktree};
 use crate::session::Session;
 use crate::snippets::{SnippetModal, SnippetUpdate};
 use crate::terminal_pane::TerminalManager;
@@ -223,18 +223,23 @@ pub enum WorktreeLaunchTarget {
     Tmux,
 }
 
-/// A worktree creation deferred to the main loop so a progress notice can be drawn first.
+/// A worktree being created on its own thread, and the tab its session will open in.
 #[derive(Debug, Clone)]
-pub struct PendingWorktree {
-    pub project: String,
+pub struct PreparingWorktree {
+    pub pane: crate::mux::PaneId,
     pub branch: String,
-    pub config: EffectiveWorktreeConfig,
-    pub target: WorktreeLaunchTarget,
+    pub progress: Arc<CreationProgress>,
 }
 
-/// A tmux launch deferred to the main loop for the same reason as [`PendingWorktree`]:
-/// starting a tmux server and waiting out the startup grace takes long enough that the
-/// key handler must not block on it before anything is painted.
+/// What the thread behind a [`PreparingWorktree`] sends back.
+#[derive(Debug)]
+pub struct WorktreeOutcome {
+    pub created: Result<CreatedWorktree>,
+    /// For a tmux target, the tmux session started in the new worktree. Started on the
+    /// same thread because the tmux server start and its startup grace block too.
+    pub tmux: Option<Result<TmuxSessionRef>>,
+}
+
 /// Where a session started from the split picker goes once it exists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewSplit {
@@ -245,6 +250,9 @@ pub struct NewSplit {
     pub project: Option<String>,
 }
 
+/// A tmux launch deferred to the main loop: starting a tmux server and waiting out the
+/// startup grace takes long enough that the key handler must not block on it before
+/// anything is painted.
 #[derive(Debug, Clone)]
 pub enum PendingTmuxLaunch {
     New {
@@ -898,8 +906,8 @@ pub struct App {
     /// Directory of the last focused pane, captured before panes are torn down so the
     /// shell wrapper can still auto-`cd` there.
     pub exit_dir: Option<String>,
-    /// A worktree the main loop should create on its next iteration.
-    pub pending_worktree: Option<PendingWorktree>,
+    /// Worktrees being created behind tabs already open for their sessions.
+    pub preparing_worktrees: Vec<PreparingWorktree>,
     pub pending_tmux_launch: Option<PendingTmuxLaunch>,
     pub scratchpad: Option<Scratchpad>,
     pub scratchpad_owner: Option<crate::mux::PaneId>,
@@ -1072,7 +1080,7 @@ impl App {
             dragging_divider: None,
             mux_on_disk,
             exit_dir: None,
-            pending_worktree: None,
+            preparing_worktrees: Vec::new(),
             pending_tmux_launch: None,
             scratchpad: None,
             scratchpad_owner: None,
@@ -3908,24 +3916,26 @@ impl App {
     /// This instance's workspace as it stands, or `None` with nothing open.
     pub fn current_workspace_record(&self) -> Option<crate::recovery::WorkspaceRecord> {
         let mux = self.mux.as_ref()?;
-        if mux.panes.is_empty() {
-            return None;
-        }
+        // A tab still waiting on its worktree has no session to resume yet, and
+        // offering it to another CST would start one in a half-made checkout.
+        let launched = || mux.panes.iter().filter(|pane| pane.is_launched());
+        launched().next()?;
         Some(crate::recovery::WorkspaceRecord {
             pid: std::process::id(),
             started_at: self.instance_started_at,
             saved_at: chrono::Utc::now(),
             launch_dir: self.cwd.clone(),
-            sessions: mux
-                .panes
-                .iter()
+            sessions: launched()
                 .map(|pane| crate::recovery::RecordedSession {
                     session_id: pane.session_id.clone(),
                     cwd: pane.cwd.to_string_lossy().to_string(),
                     title: pane.title.clone(),
                 })
                 .collect(),
-            focused_session_id: mux.focused_pane().map(|pane| pane.session_id.clone()),
+            focused_session_id: mux
+                .focused_pane()
+                .filter(|pane| pane.is_launched())
+                .map(|pane| pane.session_id.clone()),
             windows: mux.save_windows(),
         })
     }
@@ -4277,6 +4287,156 @@ impl App {
         self.view = View::Attached(id);
         self.restore_workspace_panels(id, &workspace_session_id);
         Ok(())
+    }
+
+    /// Open the tab a worktree session will run in, and create the worktree behind it.
+    ///
+    /// Creating one takes anywhere from a second to an hour — `.worktreeinclude` may
+    /// name a virtualenv — so it happens on its own thread while the tab shows how far
+    /// it has got, and every other tab stays usable. [`MuxEvent::WorktreeReady`] brings
+    /// the result back, and the session starts in this same tab.
+    pub fn open_worktree_tab(
+        &mut self,
+        project: String,
+        branch: String,
+        config: EffectiveWorktreeConfig,
+        target: WorktreeLaunchTarget,
+    ) -> Result<()> {
+        let (rows, cols) = self.pane_size;
+        let terminal_light_mode = self.theme_name().terminal_light_mode();
+        let user_config = self.config.clone();
+        let Some(mux) = self.mux.as_mut() else {
+            anyhow::bail!("Multiplexing is disabled");
+        };
+        let id = mux.allocate_id();
+        // Chosen now so the scratchpad and terminal opened while waiting already belong
+        // to the session that will start here.
+        let session_id = manager::new_session_id();
+        let events = mux.events.clone();
+        mux.push(Pane::unlaunched(
+            id,
+            branch.clone(),
+            PathBuf::from(&project),
+            session_id.clone(),
+            rows,
+            cols,
+            terminal_light_mode,
+            events.clone(),
+        ));
+        self.join_pending_split(id);
+        self.view = View::Attached(id);
+        self.restore_workspace_panels(id, &session_id);
+
+        let progress = Arc::new(CreationProgress::default());
+        self.preparing_worktrees.push(PreparingWorktree {
+            pane: id,
+            branch: branch.clone(),
+            progress: Arc::clone(&progress),
+        });
+        std::thread::spawn(move || {
+            let created = worktree::create_managed_worktree_reporting(
+                Path::new(&project),
+                &branch,
+                &config,
+                &progress,
+            );
+            let tmux = match (&created, target) {
+                (Ok(created), WorktreeLaunchTarget::Tmux) => Some(manager::start_tmux_session_for(
+                    &created.entry.path,
+                    &branch,
+                    &user_config,
+                    &session_id,
+                )),
+                _ => None,
+            };
+            let _ = events.send(MuxEvent::WorktreeReady(
+                id,
+                Box::new(WorktreeOutcome { created, tmux }),
+            ));
+        });
+        Ok(())
+    }
+
+    /// Call off the worktrees whose tabs have been closed.
+    ///
+    /// Checked from the main loop rather than wherever a tab is closed, because there
+    /// are several of those and a tab that is gone is the one fact they all share. The
+    /// worktree thread still reports back, and is answered then.
+    pub fn cancel_orphaned_worktrees(&self) {
+        for preparing in &self.preparing_worktrees {
+            let open = self
+                .mux
+                .as_ref()
+                .is_some_and(|mux| mux.pane(preparing.pane).is_some());
+            if !open {
+                preparing.progress.cancel();
+            }
+        }
+    }
+
+    /// The worktree being created behind a tab, if it is still waiting on one.
+    pub fn preparing_worktree(&self, pane: crate::mux::PaneId) -> Option<&PreparingWorktree> {
+        self.preparing_worktrees
+            .iter()
+            .find(|preparing| preparing.pane == pane)
+    }
+
+    /// Start a new Copilot session in a tab that was opened before it could run.
+    pub fn launch_new_session_in(&mut self, id: crate::mux::PaneId, cwd: &Path) -> Result<()> {
+        let session_id = self
+            .mux
+            .as_ref()
+            .and_then(|mux| mux.pane(id))
+            .map(|pane| pane.session_id.clone())
+            .context("the tab was closed")?;
+        let (program, args) = manager::new_session_command_for(&self.config, cwd, &session_id)?;
+        self.launch_in(id, cwd, program, args)
+    }
+
+    /// Attach a tmux session in a tab that was opened before it could run.
+    pub fn launch_tmux_in(
+        &mut self,
+        id: crate::mux::PaneId,
+        reference: TmuxSessionRef,
+    ) -> Result<()> {
+        let (program, args) = tmux::attach_command(&reference);
+        let cwd = reference.cwd.clone();
+        self.launch_in(id, &cwd, program, args)?;
+        self.tmux_sessions
+            .insert(reference.session_id.clone(), reference);
+        Ok(())
+    }
+
+    fn launch_in(
+        &mut self,
+        id: crate::mux::PaneId,
+        cwd: &Path,
+        program: String,
+        args: Vec<String>,
+    ) -> Result<()> {
+        let session_id = self
+            .mux
+            .as_ref()
+            .and_then(|mux| mux.pane(id))
+            .map(|pane| pane.session_id.clone())
+            .context("the tab was closed")?;
+        let events_path = self.notification_events_path(&session_id);
+        let terminal_light_mode = self.theme_name().terminal_light_mode();
+        let hooks_active = crate::hook_plugin::is_managed(&self.copilot_home);
+        let mux = self.mux.as_mut().context("Multiplexing is disabled")?;
+        let events = mux.events.clone();
+        let pane = mux.pane_mut(id).context("the tab was closed")?;
+        pane.cwd = cwd.to_path_buf();
+        pane.launch(
+            PaneLaunch {
+                program,
+                args,
+                events_path: Some(events_path),
+                terminal_light_mode,
+                hooks_active,
+            },
+            events,
+        )
     }
 
     /// Leave the focused pane running and return to the session list.
@@ -4990,7 +5150,7 @@ impl App {
             || self.snippet_modal.is_some()
             || self.command_palette.is_some()
             || self.confirm_end_tmux.is_some()
-            || self.pending_worktree.is_some()
+            || !self.preparing_worktrees.is_empty()
             || self.pending_tmux_launch.is_some()
             || self.github_inspector.as_ref().is_some_and(|inspector| {
                 matches!(

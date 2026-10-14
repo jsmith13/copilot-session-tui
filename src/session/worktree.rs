@@ -10,6 +10,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -68,6 +69,60 @@ struct WorktreeIdentity {
 pub struct CreatedWorktree {
     pub entry: ManagedWorktree,
     pub notice: Option<String>,
+}
+
+/// How far a worktree creation has got, readable from another thread while it runs.
+///
+/// Exists because the slow part is unbounded and silent: a `.worktreeinclude` naming a
+/// virtualenv copies tens of thousands of files, and a wait of an hour with no count
+/// looks exactly like a hang.
+#[derive(Debug, Default)]
+pub struct CreationProgress {
+    /// Listing what `.worktreeinclude` selects has begun. Its own stage because it
+    /// walks every ignored file in the source, which can take far longer than the
+    /// checkout before it.
+    finding: AtomicBool,
+    /// Files `.worktreeinclude` selected; zero until they have been listed.
+    to_copy: AtomicUsize,
+    copied: AtomicUsize,
+    cancelled: AtomicBool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreationStage {
+    CheckingOut,
+    FindingIncludes,
+    CopyingIncludes { copied: usize, total: usize },
+}
+
+impl CreationProgress {
+    /// Stop copying at the next file, so the creation fails and rolls itself back.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn plan_copies(&self, total: usize) {
+        self.to_copy.store(total, Ordering::Release);
+    }
+
+    pub(crate) fn note_copied(&self, copied: usize) {
+        self.copied.store(copied, Ordering::Release);
+    }
+
+    pub fn stage(&self) -> CreationStage {
+        match self.to_copy.load(Ordering::Acquire) {
+            0 if self.finding.load(Ordering::Acquire) => CreationStage::FindingIncludes,
+            0 => CreationStage::CheckingOut,
+            total => CreationStage::CopyingIncludes {
+                copied: self.copied.load(Ordering::Acquire),
+                total,
+            },
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -146,12 +201,22 @@ pub fn create_managed_worktree(
     branch: &str,
     config: &EffectiveWorktreeConfig,
 ) -> Result<CreatedWorktree> {
+    create_managed_worktree_reporting(project, branch, config, &CreationProgress::default())
+}
+
+/// [`create_managed_worktree`], counting its progress into `progress` as it goes.
+pub fn create_managed_worktree_reporting(
+    project: &Path,
+    branch: &str,
+    config: &EffectiveWorktreeConfig,
+    progress: &CreationProgress,
+) -> Result<CreatedWorktree> {
     create_managed_worktree_with(
         project,
         branch,
         config,
         &registry_path(),
-        copy_worktree_includes,
+        |source, worktree| copy_worktree_includes_reporting(source, worktree, progress),
     )
 }
 
@@ -532,14 +597,24 @@ fn short_hash(value: &str, length: usize) -> String {
     format!("{digest:x}")[..length].to_string()
 }
 
+#[cfg(test)]
 fn copy_worktree_includes(
     source_repository: &Path,
     worktree: &Path,
+) -> Result<WorktreeIncludeState> {
+    copy_worktree_includes_reporting(source_repository, worktree, &CreationProgress::default())
+}
+
+fn copy_worktree_includes_reporting(
+    source_repository: &Path,
+    worktree: &Path,
+    progress: &CreationProgress,
 ) -> Result<WorktreeIncludeState> {
     let include_path = source_repository.join(".worktreeinclude");
     if !include_path.exists() {
         return Ok(WorktreeIncludeState::default());
     }
+    progress.finding.store(true, Ordering::Release);
 
     let patterns = fs::read_to_string(&include_path).with_context(|| {
         format!(
@@ -620,8 +695,12 @@ fn copy_worktree_includes(
         candidates.push((relative.to_path_buf(), source, destination));
     }
 
+    progress.plan_copies(candidates.len());
     let mut copied = Vec::with_capacity(candidates.len());
     for (relative, source, destination) in candidates {
+        if progress.is_cancelled() {
+            bail!("Cancelled");
+        }
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent).with_context(|| {
                 format!(
@@ -641,6 +720,7 @@ fn copy_worktree_includes(
             path: relative,
             sha256: hash_file(&destination)?,
         });
+        progress.note_copied(copied.len());
     }
     Ok(WorktreeIncludeState {
         patterns: Some(patterns),
@@ -2033,5 +2113,45 @@ mod tests {
         assert!(!destination.path().join("cache").join("skip.txt").exists());
         assert!(!destination.path().join("ignored.txt").exists());
         assert!(!destination.path().join("tracked.txt").exists());
+    }
+    /// The count is what tells a long copy apart from a hang; without it a worktree
+    /// copying a virtualenv sat silent for over an hour and looked stuck.
+    #[test]
+    fn worktreeinclude_progress_counts_the_files_it_copies_out_of_those_selected() {
+        let repo = repository();
+        let destination = tempfile::tempdir().unwrap();
+        git(destination.path(), &["init"]);
+        fs::write(repo.path().join(".gitignore"), "cache/\n").unwrap();
+        fs::write(repo.path().join(".worktreeinclude"), "cache/\n").unwrap();
+        fs::create_dir_all(repo.path().join("cache")).unwrap();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            fs::write(repo.path().join("cache").join(name), name).unwrap();
+        }
+        let progress = CreationProgress::default();
+        assert_eq!(progress.stage(), CreationStage::CheckingOut);
+
+        copy_worktree_includes_reporting(repo.path(), destination.path(), &progress).unwrap();
+
+        assert_eq!(
+            progress.stage(),
+            CreationStage::CopyingIncludes {
+                copied: 3,
+                total: 3
+            }
+        );
+    }
+    /// Listing the ignored files is its own wait: in a repository with a large ignored
+    /// tree it ran for tens of seconds while the tab still claimed to be checking out.
+    #[test]
+    fn worktreeinclude_progress_reports_finding_files_once_listing_has_begun() {
+        let repo = repository();
+        let destination = tempfile::tempdir().unwrap();
+        git(destination.path(), &["init"]);
+        fs::write(repo.path().join(".worktreeinclude"), "nothing-matches/\n").unwrap();
+        let progress = CreationProgress::default();
+
+        copy_worktree_includes_reporting(repo.path(), destination.path(), &progress).unwrap();
+
+        assert_eq!(progress.stage(), CreationStage::FindingIncludes);
     }
 }

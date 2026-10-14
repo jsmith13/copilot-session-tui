@@ -39,18 +39,24 @@ pub(crate) fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect 
 /// Warn before quitting while sessions are still running.
 pub fn draw_quit_confirm(f: &mut Frame, app: &App) {
     let theme = app.theme();
-    let running: Vec<(String, bool)> = app
+    let running: Vec<(String, bool, bool)> = app
         .mux
         .as_ref()
         .map(|mux| {
             mux.panes
                 .iter()
                 .filter(|pane| pane.is_running())
-                .map(|pane| (pane.title.clone(), app.pane_is_tmux_backed(pane)))
+                .map(|pane| {
+                    (
+                        pane.title.clone(),
+                        app.pane_is_tmux_backed(pane),
+                        app.preparing_worktree(pane.id).is_some(),
+                    )
+                })
                 .collect()
         })
         .unwrap_or_default();
-    let persistent = running.iter().filter(|(_, tmux)| *tmux).count();
+    let persistent = running.iter().filter(|(_, tmux, _)| *tmux).count();
     let ending = running.len().saturating_sub(persistent);
 
     let height = (running.len() + 8).min(20) as u16;
@@ -66,8 +72,16 @@ pub fn draw_quit_confirm(f: &mut Frame, app: &App) {
         )),
         Line::from(""),
     ];
-    for (title, tmux) in running.iter().take(8) {
-        let suffix = if *tmux { " (tmux: keeps running)" } else { "" };
+    for (title, tmux, preparing) in running.iter().take(8) {
+        // Quitting stops the copy wherever it has got to, and nothing comes back to
+        // clean up after it.
+        let suffix = if *preparing {
+            " (worktree unfinished: left half made)"
+        } else if *tmux {
+            " (tmux: keeps running)"
+        } else {
+            ""
+        };
         text.push(Line::from(Span::styled(
             format!("    • {title}{suffix}"),
             Style::default().fg(theme.accent_alt),
@@ -271,41 +285,6 @@ fn project_label(cwd: &std::path::Path) -> String {
     cwd.file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_default()
-}
-
-/// Blocking-work notice, drawn on the frame before the work actually starts.
-pub fn draw_busy(f: &mut Frame, title: &str, detail: &str, theme: Theme) {
-    let area = centered_rect(50, 20, f.area());
-    prepare_popup(f, area, theme);
-
-    let block = Block::default()
-        .title(format!(" {title} "))
-        .borders(Borders::ALL)
-        .style(surface_style(theme))
-        .border_style(Style::default().fg(theme.accent_alt));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    let text = vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            format!("  ⠿  {detail}"),
-            Style::default()
-                .fg(theme.accent_alt)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  This can take a few seconds.",
-            Style::default().fg(theme.muted),
-        )),
-    ];
-    f.render_widget(
-        Paragraph::new(text)
-            .style(surface_style(theme))
-            .wrap(Wrap { trim: true }),
-        inner,
-    );
 }
 
 /// The workspaces of closed CSTs, newest first, each with enough to recognise it by:
@@ -2929,27 +2908,5 @@ mod help_tests {
             (settings_area.left()..settings_area.right())
                 .all(|x| settings[(x, y)].bg != Color::Reset)
         }));
-    }
-
-    #[test]
-    fn busy_popup_infers_and_fills_the_rendered_light_theme() {
-        let theme = ThemeName::CatppuccinLatte.theme();
-        let width = 100;
-        let height = 30;
-        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal
-            .draw(|frame| {
-                let area = frame.area();
-                fill_area(frame.buffer_mut(), area, theme.background);
-                draw_busy(frame, "Working", "Applying changes", theme);
-            })
-            .unwrap();
-
-        let area = centered_rect(50, 20, Rect::new(0, 0, width, height));
-        let buffer = terminal.backend().buffer();
-        assert_eq!(buffer[(area.x, area.y)].fg, theme.accent_alt);
-        assert_eq!(buffer[(area.x, area.y)].bg, theme.surface);
-        assert!((area.top()..area.bottom())
-            .all(|y| { (area.left()..area.right()).all(|x| buffer[(x, y)].bg != Color::Reset) }));
     }
 }

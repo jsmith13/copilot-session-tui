@@ -1,10 +1,11 @@
 #[cfg(test)]
 use crate::app::SettingsSection;
 use crate::app::{
-    App, DeleteTarget, Mode, NewSessionRequest, PendingTmuxLaunch, PendingWorktree,
-    SettingsEditField, TakeoverTarget, View, WorkspaceFocus, WorktreeLaunchTarget,
+    App, DeleteTarget, Mode, NewSessionRequest, PendingTmuxLaunch, SettingsEditField,
+    TakeoverTarget, View, WorkspaceFocus, WorktreeLaunchTarget, WorktreeOutcome,
 };
 use crate::config;
+use crate::mux::PaneId;
 use crate::session::loader;
 use crate::session::manager;
 use crate::session::tmux;
@@ -2059,69 +2060,94 @@ fn save_and_close_project_settings(app: &mut App) {
     }
 }
 
-/// Create the worktree and launch its session, rolling back if launch fails.
+/// Start the session a worktree tab was opened for, now that its worktree exists.
 ///
-/// Runs from the main loop rather than the key handler so the "creating…" notice is
-/// already on screen before this blocks.
-pub fn run_pending_worktree(app: &mut App, pending: PendingWorktree) {
-    run_worktree_launch(app, pending);
-    // A split this was started for has been joined by now, or the launch failed;
-    // either way it must not carry over to the next new session.
-    app.new_split = None;
-}
-
-fn run_worktree_launch(app: &mut App, pending: PendingWorktree) {
-    let PendingWorktree {
-        project,
-        branch,
-        config,
-        target,
-    } = pending;
-    let created = match worktree::create_managed_worktree(Path::new(&project), &branch, &config) {
+/// Arrives from the thread [`App::open_worktree_tab`] started. Whatever happens, the
+/// tab stops waiting: it either becomes the session or goes away with a message.
+pub fn finish_worktree_launch(app: &mut App, pane: PaneId, outcome: WorktreeOutcome) {
+    let Some(index) = app
+        .preparing_worktrees
+        .iter()
+        .position(|preparing| preparing.pane == pane)
+    else {
+        return;
+    };
+    let preparing = app.preparing_worktrees.remove(index);
+    let branch = preparing.branch;
+    let created = match outcome.created {
         Ok(created) => created,
+        Err(_) if preparing.progress.is_cancelled() => {
+            app.status_message = Some(format!("Cancelled the worktree for '{branch}'"));
+            return;
+        }
         Err(error) => {
-            app.branch_config = None;
-            app.worktree_launch_target = WorktreeLaunchTarget::Standard;
-            app.status_message = Some(format!("Cannot create worktree: {error}"));
+            close_unlaunched_tab(app, pane);
+            app.status_message = Some(format!("Cannot create worktree for '{branch}': {error:#}"));
             return;
         }
     };
+    let notice = created
+        .notice
+        .as_deref()
+        .map(|notice| format!(" — {notice}"))
+        .unwrap_or_default();
+
+    let tab_open = app
+        .mux
+        .as_ref()
+        .and_then(|mux| mux.pane(pane))
+        .is_some_and(|pane| pane.is_running() && !pane.is_launched());
+    if !tab_open {
+        // Closing the tab was the only way to call it off. A tmux session that started
+        // anyway is the user's to end, like any other; a bare worktree nobody will use
+        // is not worth keeping.
+        app.status_message = Some(match outcome.tmux {
+            Some(Ok(launched)) => {
+                app.track_external_session(launched.session_id.clone());
+                format!(
+                    "'{branch}' started in tmux '{}' after its tab was closed; it is still running",
+                    launched.tmux_session
+                )
+            }
+            _ => match worktree::rollback_created_worktree(&created.entry) {
+                Ok(()) => format!("Worktree for '{branch}' was ready after its tab closed; rolled back"),
+                Err(error) => format!(
+                    "Worktree for '{branch}' was ready after its tab closed; rollback failed: {error}"
+                ),
+            },
+        });
+        return;
+    }
 
     let path = created.entry.path.clone();
-    let result = match target {
-        WorktreeLaunchTarget::Standard => app
-            .attach_new_session(&path.to_string_lossy(), branch.clone())
-            .map(|_| match created.notice.as_deref() {
-                Some(notice) => format!("Isolated session on '{branch}' — {notice}"),
-                None => format!("Isolated session on '{branch}'"),
-            }),
-        WorktreeLaunchTarget::Tmux => {
-            manager::start_tmux_session(&path, &branch, &app.config).map(|launched| {
-                let mut message = complete_tmux_launch(
-                    app,
-                    launched,
-                    branch.clone(),
-                    &format!("Started '{branch}'"),
-                );
-                if let Some(notice) = created.notice.as_deref() {
-                    message.push_str(&format!(" — {notice}"));
+    match outcome.tmux {
+        None => match app.launch_new_session_in(pane, &path) {
+            Ok(()) => app.status_message = Some(format!("Isolated session on '{branch}'{notice}")),
+            Err(error) => {
+                // The worktree exists but has no session; undo it rather than leaking one.
+                close_unlaunched_tab(app, pane);
+                app.status_message = Some(match worktree::rollback_created_worktree(&created.entry) {
+                    Ok(()) => format!("Cannot start session: {error}; worktree rolled back"),
+                    Err(rollback_error) => format!(
+                        "Cannot start session: {error}; worktree rollback also failed: {rollback_error}"
+                    ),
+                });
+            }
+        },
+        Some(Ok(launched)) => {
+            app.track_external_session(launched.session_id.clone());
+            let base = format!("Started '{branch}' in tmux '{}'", launched.tmux_session);
+            app.status_message = Some(match app.launch_tmux_in(pane, launched) {
+                Ok(()) => format!("{base}; opened as a CST tab{notice}"),
+                Err(error) => {
+                    close_unlaunched_tab(app, pane);
+                    format!("{base}; could not open CST tab: {error}{notice}")
                 }
-                message
-            })
+            });
         }
-    };
-    match result {
-        Ok(message) => {
-            app.branch_config = None;
-            app.worktree_launch_target = WorktreeLaunchTarget::Standard;
-            app.status_message = Some(message);
-        }
-        Err(error) => {
-            // The worktree exists but has no session; undo it rather than leaking one.
-            let rollback = worktree::rollback_created_worktree(&created.entry);
-            app.branch_config = None;
-            app.worktree_launch_target = WorktreeLaunchTarget::Standard;
-            app.status_message = Some(match rollback {
+        Some(Err(error)) => {
+            close_unlaunched_tab(app, pane);
+            app.status_message = Some(match worktree::rollback_created_worktree(&created.entry) {
                 Ok(()) => format!("Cannot start session: {error}; worktree rolled back"),
                 Err(rollback_error) => format!(
                     "Cannot start session: {error}; worktree rollback also failed: {rollback_error}"
@@ -2129,6 +2155,18 @@ fn run_worktree_launch(app: &mut App, pending: PendingWorktree) {
             });
         }
     }
+}
+
+/// Close a tab whose session never started, as closing it by hand would.
+fn close_unlaunched_tab(app: &mut App, pane: PaneId) {
+    // A scratchpad that cannot be saved has already said so; the tab has nothing
+    // else worth keeping it open for.
+    let _ = app.forget_workspace_panels(pane);
+    if let Some(mux) = app.mux.as_mut() {
+        mux.remove(pane);
+    }
+    crate::mux_input::sync_workspace_panels(app);
+    crate::mux_input::sync_view(app);
 }
 
 fn handle_branch_name(app: &mut App, key: KeyCode) {
@@ -2159,17 +2197,19 @@ fn handle_branch_name(app: &mut App, key: KeyCode) {
             };
             let target = app.worktree_launch_target;
             if app.mux_enabled() {
-                // Creating a worktree copies files and talks to Git, which can take a
-                // few seconds. Hand it to the main loop so a progress notice is painted
-                // before we block.
-                app.pending_worktree = Some(PendingWorktree {
-                    project,
-                    branch: app.branch_input.clone(),
-                    config,
-                    target,
-                });
                 app.mode = Mode::Normal;
-                app.status_message = Some(format!("Creating worktree for '{}'…", app.branch_input));
+                app.branch_config = None;
+                app.worktree_launch_target = WorktreeLaunchTarget::Standard;
+                let branch = app.branch_input.clone();
+                app.status_message = Some(
+                    match app.open_worktree_tab(project, branch.clone(), config, target) {
+                        Ok(()) => format!("Creating worktree for '{branch}'…"),
+                        Err(error) => format!("Cannot create worktree: {error}"),
+                    },
+                );
+                // Joined by the tab just opened, or not at all; either way it must not
+                // carry over to the next new session.
+                app.new_split = None;
                 return;
             }
             app.should_new_session = Some(match target {
@@ -2758,7 +2798,7 @@ mod tests {
             }
             other => panic!("expected a tmux worktree request, got {other:?}"),
         }
-        assert!(app.pending_worktree.is_none());
+        assert!(app.preparing_worktrees.is_empty());
     }
 
     #[test]
@@ -2840,7 +2880,7 @@ mod tests {
 
         assert_eq!(app.mode, Mode::Normal);
         assert!(app.should_new_session.is_none());
-        assert!(app.pending_worktree.is_none());
+        assert!(app.preparing_worktrees.is_empty());
     }
 
     #[test]
@@ -3264,5 +3304,104 @@ mod tests {
         assert_eq!(state(&app), Some(12));
         handle_project_settings(&mut app, KeyCode::Char(' '));
         assert_eq!(state(&app), None, "and back to inheriting");
+    }
+    fn app_with_waiting_tab(
+        branch: &str,
+    ) -> (
+        App,
+        PaneId,
+        std::sync::Arc<crate::session::worktree::CreationProgress>,
+    ) {
+        let config = config::UserConfig {
+            mux: true,
+            ..config::UserConfig::default()
+        };
+        let mut app = App::new(Vec::new(), config);
+        app.disable_workspace_state_persistence();
+        app.disable_config_persistence();
+        let mux = app.mux.as_mut().unwrap();
+        let events = mux.events.clone();
+        let id = mux.allocate_id();
+        mux.push(crate::mux::Pane::unlaunched(
+            id,
+            branch.to_string(),
+            std::env::temp_dir(),
+            format!("{branch}-session"),
+            24,
+            80,
+            Some(false),
+            events,
+        ));
+        app.view = View::Attached(id);
+        let progress = std::sync::Arc::new(crate::session::worktree::CreationProgress::default());
+        app.preparing_worktrees.push(crate::app::PreparingWorktree {
+            pane: id,
+            branch: branch.to_string(),
+            progress: std::sync::Arc::clone(&progress),
+        });
+        (app, id, progress)
+    }
+
+    /// A tab left waiting forever on a worktree that will never exist is worse than the
+    /// modal it replaced, which at least went away.
+    #[test]
+    fn a_worktree_that_cannot_be_created_takes_its_waiting_tab_away_and_says_why() {
+        let (mut app, id, _) = app_with_waiting_tab("copilot/doomed");
+
+        finish_worktree_launch(
+            &mut app,
+            id,
+            WorktreeOutcome {
+                created: Err(
+                    anyhow::anyhow!("disk is full").context("Worktree initialization failed")
+                ),
+                tmux: None,
+            },
+        );
+
+        assert!(app.mux.as_ref().unwrap().pane(id).is_none());
+        assert!(app.preparing_worktrees.is_empty());
+        let message = app.status_message.clone().unwrap_or_default();
+        assert!(message.contains("copilot/doomed"), "got: {message}");
+        assert!(message.contains("disk is full"), "got: {message}");
+    }
+
+    /// Closing the tab is the only way to call a creation off. Letting the copy run to
+    /// the end and deleting it then could keep the disk busy for another hour.
+    #[test]
+    fn closing_a_waiting_tab_cancels_its_worktree_and_says_so_when_the_thread_returns() {
+        let (mut app, id, progress) = app_with_waiting_tab("copilot/abandoned");
+        app.cancel_orphaned_worktrees();
+        assert!(
+            !progress.is_cancelled(),
+            "an open tab must keep its worktree going"
+        );
+
+        app.mux.as_mut().unwrap().remove(id);
+        app.cancel_orphaned_worktrees();
+        assert!(progress.is_cancelled());
+
+        finish_worktree_launch(
+            &mut app,
+            id,
+            WorktreeOutcome {
+                created: Err(anyhow::anyhow!("Cancelled")),
+                tmux: None,
+            },
+        );
+        assert!(app.preparing_worktrees.is_empty());
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Cancelled the worktree for 'copilot/abandoned'")
+        );
+    }
+
+    /// Another CST offered this workspace would resume a session that was never
+    /// created, in a checkout that may be half copied.
+    #[test]
+    fn a_tab_still_waiting_on_its_worktree_is_left_out_of_the_recoverable_workspace() {
+        let (app, _, _) = app_with_waiting_tab("copilot/unborn");
+
+        assert!(app.current_workspace_record().is_none());
     }
 }

@@ -72,7 +72,10 @@ pub struct Pane {
     has_visible_output: Arc<AtomicBool>,
     _lifecycle_monitor: Option<LifecycleMonitor>,
     _hook_monitor: Option<HookMonitor>,
-    pty: PtySession,
+    /// `None` until [`Self::launch`] runs: a tab can be opened for a session whose
+    /// directory does not exist yet, such as a worktree still being created, so the
+    /// user can wait on it from its tab rather than behind a modal.
+    pty: Option<PtySession>,
     mouse_captured: bool,
     /// The view is scrolled up into history. Tracked here so a keystroke can tell
     /// without taking the parser lock, which the reader thread holds while parsing.
@@ -149,6 +152,15 @@ pub enum PaneNotification {
     Error,
 }
 
+/// The process half of [`PaneSpec`], for starting a pane that already has a tab.
+pub struct PaneLaunch {
+    pub program: String,
+    pub args: Vec<String>,
+    pub events_path: Option<PathBuf>,
+    pub terminal_light_mode: Option<bool>,
+    pub hooks_active: bool,
+}
+
 /// Everything needed to start a pane, grouped so callers don't juggle a long argument list.
 pub struct PaneSpec {
     pub id: PaneId,
@@ -187,7 +199,113 @@ impl Pane {
             terminal_light_mode,
             hooks_active,
         } = spec;
+        let mut pane = Self::unlaunched(
+            id,
+            title,
+            cwd,
+            session_id,
+            rows,
+            cols,
+            terminal_light_mode,
+            events.clone(),
+        );
+        pane.launch(
+            PaneLaunch {
+                program,
+                args,
+                events_path,
+                terminal_light_mode,
+                hooks_active,
+            },
+            events,
+        )?;
+        Ok(pane)
+    }
+
+    /// A pane with no process behind it yet, holding a tab until [`Self::launch`].
+    ///
+    /// It counts as running — it is on its way, and closing CST should ask about it —
+    /// and it is blank, so it draws as starting. Input sent to it is dropped.
+    #[allow(clippy::too_many_arguments)]
+    pub fn unlaunched(
+        id: PaneId,
+        title: String,
+        cwd: PathBuf,
+        session_id: String,
+        rows: u16,
+        cols: u16,
+        terminal_light_mode: Option<bool>,
+        events: Sender<MuxEvent>,
+    ) -> Self {
         let size = pty_size(rows, cols);
+        // Nothing reads this: with no child, the emulator has nobody to answer.
+        let (replies, _) = std::sync::mpsc::channel();
+        let parser = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
+            size.rows,
+            size.cols,
+            5000,
+            PaneCallbacks::new(id, replies, events, terminal_light_mode),
+        )));
+        Self {
+            id,
+            session_id,
+            title,
+            cwd,
+            status: PaneStatus::Running,
+            started_at: Instant::now(),
+            parser,
+            has_visible_output: Arc::new(AtomicBool::new(false)),
+            _lifecycle_monitor: None,
+            _hook_monitor: None,
+            pty: None,
+            mouse_captured: false,
+            scrolled_back: false,
+            viewport: Viewport {
+                x: 0,
+                y: 0,
+                rows: size.rows,
+                cols: size.cols,
+            },
+            composer_occupied: false,
+            working: false,
+            progress_state: crate::host_terminal::ProgressState::Clear,
+            raw_progress_generation: 0,
+            hook_state: None,
+            hook_waiting: None,
+            hook_timestamp: 0,
+            hook_ready_pending: None,
+            hook_ready_raw_generation: 0,
+            working_from_raw_progress: false,
+            raw_progress_discredited: false,
+            raw_completion_pending: false,
+            hook_completion_window: false,
+            attention_resolved_at: 0,
+            pending_inputs: Vec::new(),
+            needs_attention: false,
+            ready_sent_in_cycle: false,
+            error_sent_in_cycle: false,
+        }
+    }
+
+    /// Whether a process has been started behind this pane.
+    pub fn is_launched(&self) -> bool {
+        self.pty.is_some()
+    }
+
+    /// Start the child of a pane made by [`Self::unlaunched`], at its current size.
+    ///
+    /// On failure the pane is left exactly as it was, still unlaunched.
+    pub fn launch(&mut self, launch: PaneLaunch, events: Sender<MuxEvent>) -> Result<()> {
+        anyhow::ensure!(self.pty.is_none(), "the session has already been started");
+        let PaneLaunch {
+            program,
+            args,
+            events_path,
+            terminal_light_mode,
+            hooks_active,
+        } = launch;
+        let id = self.id;
+        let size = pty_size(self.viewport.rows, self.viewport.cols);
         let lifecycle_baseline = events_path
             .as_deref()
             .map(crate::events::lifecycle::capture_file_baseline)
@@ -228,7 +346,7 @@ impl Pane {
         let executable = crate::updater::invocation_executable()
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let mut environment = vec![(crate::threads::SESSION_ID_ENV, session_id.as_str())];
+        let mut environment = vec![(crate::threads::SESSION_ID_ENV, self.session_id.as_str())];
         if !executable.is_empty() {
             environment.push((crate::threads::CLI_PATH_ENV, executable.as_str()));
         }
@@ -243,7 +361,14 @@ impl Pane {
         if !inherited_path.is_empty() {
             environment.push(("PATH", inherited_path.as_str()));
         }
-        let pty = PtySession::spawn(&program, &args, Some(&cwd), size, &environment, chunk_tx)?;
+        let pty = PtySession::spawn(
+            &program,
+            &args,
+            Some(&self.cwd),
+            size,
+            &environment,
+            chunk_tx,
+        )?;
 
         // Device-status replies must reach the child, or ConPTY stalls on startup.
         let parser = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
@@ -299,45 +424,16 @@ impl Pane {
             })
         });
 
-        Ok(Self {
-            id,
-            session_id,
-            title,
-            cwd,
-            status: PaneStatus::Running,
-            started_at: Instant::now(),
-            parser,
-            has_visible_output,
-            _lifecycle_monitor: lifecycle_monitor,
-            _hook_monitor: hook_monitor,
-            pty,
-            mouse_captured: false,
-            scrolled_back: false,
-            viewport: Viewport {
-                x: 0,
-                y: 0,
-                rows: size.rows,
-                cols: size.cols,
-            },
-            composer_occupied: false,
-            working: false,
-            progress_state: crate::host_terminal::ProgressState::Clear,
-            raw_progress_generation: 0,
-            hook_state: seeded_hook_state,
-            hook_waiting: None,
-            hook_timestamp: 0,
-            hook_ready_pending: None,
-            hook_ready_raw_generation: 0,
-            working_from_raw_progress: false,
-            raw_progress_discredited: false,
-            raw_completion_pending: false,
-            hook_completion_window: false,
-            attention_resolved_at: 0,
-            pending_inputs: Vec::new(),
-            needs_attention: false,
-            ready_sent_in_cycle: false,
-            error_sent_in_cycle: false,
-        })
+        self.parser = parser;
+        self.has_visible_output = has_visible_output;
+        self._lifecycle_monitor = lifecycle_monitor;
+        self._hook_monitor = hook_monitor;
+        self.pty = Some(pty);
+        self.hook_state = seeded_hook_state;
+        // The startup clock is about the CLI booting, not whatever kept the tab
+        // waiting before it.
+        self.started_at = Instant::now();
+        Ok(())
     }
 
     pub fn is_running(&self) -> bool {
@@ -1060,8 +1156,8 @@ impl Pane {
         } else {
             false
         };
-        if let Some(bytes) = keys::encode(key, application_cursor) {
-            self.pty.write(&bytes)?;
+        if let (Some(bytes), Some(pty)) = (keys::encode(key, application_cursor), &mut self.pty) {
+            pty.write(&bytes)?;
         }
         Ok(())
     }
@@ -1072,13 +1168,19 @@ impl Pane {
         }
         self.return_to_live_screen();
         let bytes = keys::encode_paste(text, self.bracketed_paste());
-        self.pty.write(&bytes)
+        match &mut self.pty {
+            Some(pty) => pty.write(&bytes),
+            None => Ok(()),
+        }
     }
 
     /// Paste a snippet without allowing a line break to become an Enter keypress.
     pub fn send_prompt_snippet(&mut self, text: &str) -> Result<()> {
         if !self.is_running() {
             anyhow::bail!("the focused session is no longer running");
+        }
+        if self.pty.is_none() {
+            anyhow::bail!("the session has not started yet");
         }
         self.return_to_live_screen();
         if text.is_empty() {
@@ -1097,7 +1199,10 @@ impl Pane {
             );
         }
         let bytes = keys::encode_paste(text, bracketed);
-        self.pty.write(&bytes)
+        match &mut self.pty {
+            Some(pty) => pty.write(&bytes),
+            None => Ok(()),
+        }
     }
 
     pub fn handle_mouse(&mut self, event: MouseEvent) -> Result<bool> {
@@ -1137,8 +1242,8 @@ impl Pane {
             if matches!(event.kind, MouseEventKind::Up(_)) {
                 self.mouse_captured = false;
             }
-            if let Some(sequence) = sequence {
-                self.pty.write(&sequence)?;
+            if let (Some(sequence), Some(pty)) = (sequence, &mut self.pty) {
+                pty.write(&sequence)?;
                 return Ok(true);
             }
             Ok(false)
@@ -1203,7 +1308,9 @@ impl Pane {
             rows: size.rows,
             cols: size.cols,
         };
-        self.pty.resize(size)?;
+        if let Some(pty) = &mut self.pty {
+            pty.resize(size)?;
+        }
         Ok(())
     }
 
@@ -1222,16 +1329,21 @@ impl Pane {
     }
 
     pub fn kill(&self) -> Result<()> {
-        self.pty.kill()
+        match &self.pty {
+            Some(pty) => pty.kill(),
+            None => Ok(()),
+        }
     }
 
     pub fn shutdown(&mut self) -> Result<bool> {
         if !self.is_running() {
             return Ok(false);
         }
-        let outcome = self
-            .pty
-            .terminate_and_wait(std::time::Duration::from_secs(3))?;
+        let Some(pty) = &self.pty else {
+            self.mark_exited(None);
+            return Ok(false);
+        };
+        let outcome = pty.terminate_and_wait(std::time::Duration::from_secs(3))?;
         self.mark_exited(outcome.code);
         Ok(outcome.terminated)
     }
@@ -1239,7 +1351,7 @@ impl Pane {
     /// Pick up an exit that happened without the reader thread noticing yet.
     pub fn poll_exit(&mut self) {
         if self.is_running() {
-            if let Some(code) = self.pty.try_wait() {
+            if let Some(code) = self.pty.as_ref().and_then(PtySession::try_wait) {
                 self.mark_exited(Some(code));
             }
         }
@@ -2887,5 +2999,49 @@ mod tests {
 
         pane.kill().unwrap();
         wait_for_exit(&rx, &mut pane);
+    }
+    /// A worktree tab exists for minutes before its session can. Until then it has to
+    /// read as a session on its way, swallow typing rather than fail on it, and then
+    /// become that session in place, at whatever size the tab had grown to.
+    #[test]
+    fn an_unlaunched_pane_waits_without_a_process_then_starts_its_child_in_place() {
+        let (tx, rx) = mpsc::channel();
+        let mut pane = Pane::unlaunched(
+            7,
+            "waiting".to_string(),
+            std::env::temp_dir(),
+            "test-session-7".to_string(),
+            24,
+            80,
+            Some(false),
+            tx.clone(),
+        );
+        assert!(pane.is_running());
+        assert!(pane.is_blank());
+        assert!(!pane.is_launched());
+        pane.send_key(&KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(pane.send_prompt_snippet("wake up").is_err());
+        pane.resize(30, 100).unwrap();
+
+        let (program, args) = shell_command("echo launched");
+        pane.launch(
+            PaneLaunch {
+                program,
+                args,
+                events_path: None,
+                terminal_light_mode: Some(false),
+                hooks_active: false,
+            },
+            tx,
+        )
+        .unwrap();
+
+        assert!(pane.is_launched());
+        let size = pane.pty.as_ref().unwrap().size();
+        assert_eq!((size.rows, size.cols), (30, 100));
+        assert_eq!(wait_for_exit(&rx, &mut pane), Some(0));
+        let screen = pane.with_screen(|screen| screen.contents()).unwrap();
+        assert!(screen.contains("launched"), "got: {screen:?}");
     }
 }
