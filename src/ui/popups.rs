@@ -959,6 +959,7 @@ pub fn draw_help(f: &mut Frame, app: &mut App) {
         Line::from(""),
         help_section(theme, "Favorites"),
         help_line(theme, "Space", "Toggle selected session favorite"),
+        help_line(theme, "n Space", "Start a new session as a favorite"),
         help_line(theme, "g", "Grab a favorite, then ↑/↓ to reorder"),
         help_line(theme, "T", "Open favorites as panes or terminal tabs"),
         help_line(theme, "R", "Recover the tabs of a closed or crashed CST"),
