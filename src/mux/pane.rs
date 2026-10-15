@@ -659,7 +659,8 @@ impl Pane {
     /// hyperlinks.
     ///
     /// Web links only. A file link handed to a terminal is opened with whatever the file's
-    /// type launches, so those stay with CST, which reveals rather than runs them.
+    /// type launches, so those stay with CST, which reveals rather than runs them — opening
+    /// only an HTML page, and only in the browser.
     pub fn web_hyperlinks(&self) -> Vec<crate::ui::hyperlinks::HyperlinkRun> {
         let Ok(parser) = self.parser.lock() else {
             return Vec::new();

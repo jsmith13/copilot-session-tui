@@ -14,7 +14,8 @@
 //!
 //! Only web links are drawn this way. A terminal opens a `file:` link with whatever the
 //! file's type launches, so a link to an `.exe` would run it — CST keeps those to itself
-//! and reveals them in their folder instead. See [`crate::links`].
+//! and reveals them in their folder instead, opening only an HTML page in the browser.
+//! See [`crate::links`].
 
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::buffer::Buffer;
