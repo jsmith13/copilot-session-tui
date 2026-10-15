@@ -131,9 +131,15 @@ fn workspace(sandbox: &Path) -> Result<String> {
 
     // Size the pane to the area it will actually occupy, so the transcript wraps
     // exactly as it will on screen.
-    let layout = crate::ui::attached_layout(Rect::new(0, 0, WIDTH, HEIGHT), true, false);
-    let rows = layout.chat.height.saturating_sub(2);
-    let cols = layout.chat.width.saturating_sub(2);
+    let layout = crate::ui::attached_layout_sized(
+        Rect::new(0, 0, WIDTH, HEIGHT),
+        true,
+        false,
+        false,
+        crate::ui::DockSizes::default(),
+    );
+    let chat = layout.chat_pane();
+    let (rows, cols) = (chat.height, chat.width);
 
     let events = app.mux.as_ref().expect("mux is enabled").events.clone();
     // A pane needs a live child to report itself as running. This one only has to
@@ -159,6 +165,7 @@ fn workspace(sandbox: &Path) -> Result<String> {
             args,
             events_path: None,
             terminal_light_mode: Some(false),
+            hooks_active: false,
         },
         rows,
         cols,
