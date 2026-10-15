@@ -1111,6 +1111,105 @@ impl Drop for TerminalEventReader {
     }
 }
 
+/// The threads feeding the multiplexer's event channel, which exist only while it does.
+struct MuxServices {
+    _terminal_events: TerminalEventReader,
+    _config_watcher: ConfigWatcher,
+    _thread_watcher: Option<threads::watcher::ThreadWatcher>,
+}
+
+impl MuxServices {
+    fn start(app: &App, config_path: &Path) -> Option<Self> {
+        let mux = app.mux.as_ref()?;
+        // A dedicated thread feeds terminal events into the same channel as PTY output,
+        // so the loop can wait on both at once instead of polling. Reading through
+        // `paste` rebuilds the paste events Windows delivers as bare keystrokes; because
+        // the thread does nothing but read, a queued burst can only have come from a
+        // paste.
+        let terminal_events = TerminalEventReader::start(mux.events.clone());
+        let config_watcher = ConfigWatcher::start(
+            mux.events.clone(),
+            config_path.to_path_buf(),
+            app.config_revision_handle(),
+            std::time::Duration::from_secs(1),
+        );
+        // Only with the multiplexer, because without it there are no panes to wake. The
+        // login is read once: it is what decides whether a comment came from one of our
+        // own agents, and asking GitHub every poll would be a round trip for an answer
+        // that does not change.
+        let thread_watcher = app
+            .config
+            .threads_enabled
+            .then(|| threads::doorbell::current_login("github.com").ok())
+            .flatten()
+            .map(|login| {
+                threads::watcher::ThreadWatcher::start(
+                    mux.events.clone(),
+                    threads::store::state_root(),
+                    login,
+                    threads::watcher::WatchSettings {
+                        poll_interval: std::time::Duration::from_secs(
+                            threads::doorbell::DEFAULT_POLL_SECONDS,
+                        ),
+                        stall_detection: app.config.thread_stall_detection,
+                        trusted_authors: app.config.thread_trusted_authors.clone(),
+                        wakeups_per_hour: app
+                            .config
+                            .thread_wakeups_per_hour
+                            .unwrap_or(threads::DEFAULT_WAKEUPS_PER_HOUR),
+                    },
+                )
+            });
+        Some(Self {
+            _terminal_events: terminal_events,
+            _config_watcher: config_watcher,
+            _thread_watcher: thread_watcher,
+        })
+    }
+}
+
+/// Bring the multiplexer up or down to match the setting, once that is safe.
+///
+/// Turning it off waits for the last tab to close: the sessions in tabs are children of
+/// this process, and going down now would end them.
+fn switch_mux_mode(
+    app: &mut App,
+    services: &mut Option<MuxServices>,
+    config_path: &Path,
+) -> Result<bool> {
+    if app.config.mux && app.mux.is_none() {
+        app.start_mux();
+        *services = MuxServices::start(app, config_path);
+        return Ok(true);
+    }
+    if app.config.mux || app.mux.is_none() || !app.mux_can_stop() {
+        return Ok(false);
+    }
+    // The reader stops first. It only finds out the channel is gone by failing to send
+    // what it just read, so the other order would drop a keystroke.
+    *services = None;
+    let queued: Vec<_> = app
+        .mux
+        .as_ref()
+        .map(|mux| mux.receiver.try_iter().collect())
+        .unwrap_or_default();
+    for event in queued {
+        match event {
+            mux::MuxEvent::Term(event) => apply_terminal_event(app, event)?,
+            other => {
+                mux_input::handle_mux_event(app, other);
+            }
+        }
+    }
+    // One of those keys may have opened a tab, or turned the setting back on.
+    if !app.config.mux && app.mux_can_stop() {
+        app.stop_mux();
+    } else {
+        *services = MuxServices::start(app, config_path);
+    }
+    Ok(true)
+}
+
 /// How often the session list looks again for workspaces of CSTs closed meanwhile.
 const RECOVERY_SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -1125,56 +1224,15 @@ fn run_app(
     app.request_config_reload();
     app.refresh_recoverable();
     let mut last_recovery_scan = std::time::Instant::now();
-    let _config_watcher = app.mux.as_ref().map(|mux| {
-        ConfigWatcher::start(
-            mux.events.clone(),
-            config_path.clone(),
-            app.config_revision_handle(),
-            std::time::Duration::from_secs(1),
-        )
-    });
-    // Started here rather than at construction so it only exists when there are panes to
-    // wake. The login is read once: it is what decides whether a comment came from one
-    // of our own agents, and asking GitHub every poll would be a round trip for an
-    // answer that does not change.
-    let _thread_watcher = app
-        .mux
-        .as_ref()
-        .filter(|_| app.config.threads_enabled)
-        .and_then(|mux| {
-            let login = threads::doorbell::current_login("github.com").ok()?;
-            Some(threads::watcher::ThreadWatcher::start(
-                mux.events.clone(),
-                threads::store::state_root(),
-                login,
-                threads::watcher::WatchSettings {
-                    poll_interval: std::time::Duration::from_secs(
-                        threads::doorbell::DEFAULT_POLL_SECONDS,
-                    ),
-                    stall_detection: app.config.thread_stall_detection,
-                    trusted_authors: app.config.thread_trusted_authors.clone(),
-                    wakeups_per_hour: app
-                        .config
-                        .thread_wakeups_per_hour
-                        .unwrap_or(threads::DEFAULT_WAKEUPS_PER_HOUR),
-                },
-            ))
-        });
+    let mut mux_services = MuxServices::start(app, &config_path);
     let mut last_non_mux_config_check = std::time::Instant::now();
-    // In mux mode a dedicated thread feeds terminal events into the same channel as PTY
-    // output, so the loop can wait on both at once instead of polling. Reading through
-    // `paste` rebuilds the paste events Windows delivers as bare keystrokes; because the
-    // thread does nothing but read, a queued burst can only have come from a paste.
-    let _terminal_events = app
-        .mux
-        .as_ref()
-        .map(|mux| TerminalEventReader::start(mux.events.clone()));
     let mut terminal_title = String::new();
     let mut repaint = true;
     let mut last_paint = std::time::Instant::now();
     let mut prepared_restart = None;
 
     loop {
+        repaint |= switch_mux_mode(app, &mut mux_services, &config_path)?;
         repaint |= app.poll_config_reload();
         if app.mux.is_none()
             && last_non_mux_config_check.elapsed() >= std::time::Duration::from_secs(1)
@@ -2271,6 +2329,99 @@ mod tests {
             std::time::Instant::now() - std::time::Duration::from_millis(150)
         ));
         assert!(mux_paint_due(&app, true, std::time::Instant::now()));
+    }
+
+    /// No thread watcher, so switching modes in a test never asks `gh` who is logged in.
+    fn app_without_thread_watcher(mux: bool) -> App {
+        let mut app = App::new(
+            Vec::new(),
+            config::UserConfig {
+                mux,
+                threads_enabled: false,
+                ..config::UserConfig::default()
+            },
+        );
+        app.disable_config_persistence();
+        app
+    }
+
+    #[test]
+    fn turning_the_multiplexer_on_and_off_in_settings_needs_no_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.json");
+        let mut app = app_without_thread_watcher(false);
+        let mut services = MuxServices::start(&app, &config_path);
+        assert!(services.is_none());
+
+        app.set_mux_setting(true);
+        assert!(switch_mux_mode(&mut app, &mut services, &config_path).unwrap());
+        assert!(app.mux_enabled());
+        assert!(
+            services.is_some(),
+            "without the reader the multiplexer would never see a key"
+        );
+
+        app.set_mux_setting(false);
+        assert!(switch_mux_mode(&mut app, &mut services, &config_path).unwrap());
+        assert!(!app.mux_enabled());
+        assert!(
+            services.is_none(),
+            "a reader left running would race the launcher for every key"
+        );
+        assert!(!switch_mux_mode(&mut app, &mut services, &config_path).unwrap());
+    }
+
+    #[test]
+    fn turning_the_multiplexer_off_waits_for_the_open_tabs_instead_of_ending_their_sessions() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.json");
+        let mut app = app_without_thread_watcher(true);
+        let mut services = MuxServices::start(&app, &config_path);
+        let events = app.mux.as_ref().unwrap().events.clone();
+        let (program, args) = if cfg!(windows) {
+            (
+                "cmd.exe".to_string(),
+                vec!["/c".to_string(), "ping -n 30 127.0.0.1 >nul".to_string()],
+            )
+        } else {
+            (
+                "/bin/sh".to_string(),
+                vec!["-c".to_string(), "sleep 30".to_string()],
+            )
+        };
+        let pane = Pane::spawn(
+            PaneSpec {
+                id: 1,
+                title: "Running".to_string(),
+                cwd: std::env::temp_dir(),
+                session_id: "running".to_string(),
+                program,
+                args,
+                events_path: None,
+                terminal_light_mode: Some(false),
+                hooks_active: false,
+            },
+            24,
+            80,
+            events,
+        )
+        .unwrap();
+        app.mux.as_mut().unwrap().push(pane);
+
+        app.set_mux_setting(false);
+        assert!(app
+            .status_message
+            .as_deref()
+            .unwrap()
+            .contains("once the open tabs are closed"));
+        assert!(!switch_mux_mode(&mut app, &mut services, &config_path).unwrap());
+        assert!(app.mux.as_ref().unwrap().pane(1).is_some());
+        assert!(!app.persistable_config().mux, "the choice is saved already");
+
+        app.mux.as_mut().unwrap().remove(1);
+        assert!(switch_mux_mode(&mut app, &mut services, &config_path).unwrap());
+        assert!(!app.mux_enabled());
+        assert!(services.is_none());
     }
 
     #[test]

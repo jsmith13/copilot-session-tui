@@ -816,7 +816,7 @@ pub(crate) fn handle_favorite_open(app: &mut App, key: KeyCode) {
             app.mode = Mode::Normal;
             if app.mux.is_none() {
                 app.status_message =
-                    Some("Panes need mux mode; restart CST with --mux".to_string());
+                    Some("Panes need the multiplexer; turn it on in settings (,)".to_string());
                 return;
             }
             app.status_message = Some(app.open_favorites_as_panes());
@@ -1724,13 +1724,8 @@ fn handle_settings(app: &mut App, key: KeyCode) {
                 SettingsEditField::WorktreeRoot,
                 app.config.worktree.root.to_string_lossy().to_string(),
             ),
-            6 => {
-                // The row reflects the persisted value; a `--mux` override only lasts
-                // for this invocation and must not be flipped by editing settings.
-                app.mux_on_disk = !app.mux_on_disk;
-                app.status_message =
-                    Some("Multiplexer setting applies the next time CST starts".to_string());
-            }
+            // The row shows the saved value, which a `--mux` override does not touch.
+            6 => app.set_mux_setting(!app.mux_on_disk),
             7 => begin_global_edit(
                 app,
                 SettingsEditField::MuxPrefix,
@@ -2346,6 +2341,15 @@ pub fn maybe_load_details(app: &mut App) {
 mod tests {
     use super::*;
 
+    /// CST as a launcher, which hands the terminal to Copilot. No longer the default, so
+    /// tests of what the launcher queues have to ask for it.
+    fn launcher_config() -> config::UserConfig {
+        config::UserConfig {
+            mux: false,
+            ..config::UserConfig::default()
+        }
+    }
+
     #[test]
     fn pasting_into_the_search_prompt_types_the_text() {
         let mut app = App::new(Vec::new(), config::UserConfig::default());
@@ -2730,13 +2734,16 @@ mod tests {
 
     #[test]
     fn choosing_panes_without_mux_says_so_instead_of_failing_silently() {
-        let mut app = App::new(Vec::new(), config::UserConfig::default());
+        let mut app = App::new(Vec::new(), launcher_config());
 
         handle_normal(&mut app, KeyCode::Char('T'));
         handle_favorite_open(&mut app, KeyCode::Char('p'));
 
         assert_eq!(app.mode, Mode::Normal);
-        assert!(app.status_message.unwrap().contains("mux mode"));
+        let status = app.status_message.unwrap();
+        assert!(status.contains("multiplexer"));
+        // Turning it on no longer needs a restart, so telling the user to do one is wrong.
+        assert!(!status.contains("restart"));
     }
 
     #[test]
@@ -2777,7 +2784,7 @@ mod tests {
     fn new_session_uses_cwd_project_without_a_filter() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir(temp.path().join(".git")).unwrap();
-        let mut app = App::new(Vec::new(), config::UserConfig::default());
+        let mut app = App::new(Vec::new(), launcher_config());
         app.set_cwd_context(temp.path().to_string_lossy().to_string(), false);
         assert!(app.project_filter.is_none());
 
@@ -2809,7 +2816,7 @@ mod tests {
             tool_call_count: 0,
             details_parsed_len: 0,
         };
-        let mut config = config::UserConfig::default();
+        let mut config = launcher_config();
         config.tmux_keys.resume_session = "a".to_string();
         let mut app = App::new(vec![session], config);
         app.tmux_support = crate::session::tmux::TmuxSupport::Available;
@@ -2839,7 +2846,7 @@ mod tests {
             .status()
             .unwrap()
             .success());
-        let mut config = config::UserConfig::default();
+        let mut config = launcher_config();
         config.worktree.root = temp.path().join("worktrees");
         let mut app = App::new(Vec::new(), config);
         app.tmux_support = crate::session::tmux::TmuxSupport::Available;
@@ -2981,7 +2988,7 @@ mod tests {
             .status()
             .unwrap()
             .success());
-        let mut config = config::UserConfig::default();
+        let mut config = launcher_config();
         config.worktree.root = temp.path().join("worktrees");
         let mut app = App::new(Vec::new(), config);
         app.disable_config_persistence();

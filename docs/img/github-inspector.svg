@@ -220,14 +220,16 @@
 <text x="16.0" y="461.5" fill="#8839ef" textLength="9.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <text x="34.0" y="461.5" fill="#179299" textLength="117.0" lengthAdjust="spacing" font-weight="bold" xml:space="preserve">Tab/Shift+Tab</text>
 <text x="151.0" y="461.5" fill="#4c4f69" textLength="63.0" lengthAdjust="spacing" xml:space="preserve"> tabs  </text>
-<text x="214.0" y="461.5" fill="#179299" textLength="18.0" lengthAdjust="spacing" font-weight="bold" xml:space="preserve">↑↓</text>
-<text x="232.0" y="461.5" fill="#4c4f69" textLength="81.0" lengthAdjust="spacing" xml:space="preserve"> select  </text>
-<text x="313.0" y="461.5" fill="#179299" textLength="18.0" lengthAdjust="spacing" font-weight="bold" xml:space="preserve">←→</text>
-<text x="331.0" y="461.5" fill="#4c4f69" textLength="63.0" lengthAdjust="spacing" xml:space="preserve"> fold  </text>
-<text x="394.0" y="461.5" fill="#179299" textLength="45.0" lengthAdjust="spacing" font-weight="bold" xml:space="preserve">Enter</text>
-<text x="439.0" y="461.5" fill="#4c4f69" textLength="63.0" lengthAdjust="spacing" xml:space="preserve"> diff  </text>
-<text x="502.0" y="461.5" fill="#179299" textLength="9.0" lengthAdjust="spacing" font-weight="bold" xml:space="preserve">q</text>
-<text x="511.0" y="461.5" fill="#4c4f69" textLength="612.0" lengthAdjust="spacing" xml:space="preserve"> close                                                              </text>
+<text x="214.0" y="461.5" fill="#179299" textLength="9.0" lengthAdjust="spacing" font-weight="bold" xml:space="preserve">r</text>
+<text x="223.0" y="461.5" fill="#4c4f69" textLength="153.0" lengthAdjust="spacing" xml:space="preserve"> Copilot review  </text>
+<text x="376.0" y="461.5" fill="#179299" textLength="18.0" lengthAdjust="spacing" font-weight="bold" xml:space="preserve">↑↓</text>
+<text x="394.0" y="461.5" fill="#4c4f69" textLength="81.0" lengthAdjust="spacing" xml:space="preserve"> select  </text>
+<text x="475.0" y="461.5" fill="#179299" textLength="18.0" lengthAdjust="spacing" font-weight="bold" xml:space="preserve">←→</text>
+<text x="493.0" y="461.5" fill="#4c4f69" textLength="63.0" lengthAdjust="spacing" xml:space="preserve"> fold  </text>
+<text x="556.0" y="461.5" fill="#179299" textLength="45.0" lengthAdjust="spacing" font-weight="bold" xml:space="preserve">Enter</text>
+<text x="601.0" y="461.5" fill="#4c4f69" textLength="63.0" lengthAdjust="spacing" xml:space="preserve"> diff  </text>
+<text x="664.0" y="461.5" fill="#179299" textLength="9.0" lengthAdjust="spacing" font-weight="bold" xml:space="preserve">q</text>
+<text x="673.0" y="461.5" fill="#4c4f69" textLength="450.0" lengthAdjust="spacing" xml:space="preserve"> close                                            </text>
 <text x="1123.0" y="461.5" fill="#8839ef" textLength="9.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <text x="16.0" y="479.5" fill="#8839ef" textLength="1116.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘</text>
 </svg>

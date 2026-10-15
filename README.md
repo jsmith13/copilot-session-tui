@@ -34,7 +34,7 @@ A terminal user interface for managing GitHub Copilot CLI sessions. Browse, sear
 - **Session details** — preview edited files, last message, and session stats
 - **Resume** — press Enter to launch `copilot --resume` directly
 - **Isolated sessions** — press `N` to create a branch-backed Git worktree before launching Copilot
-- **Multiplexer** — optionally run sessions as panes inside CST, tmux-style, instead of handing over the terminal
+- **Multiplexer** — run sessions as panes inside CST, tmux-style, or turn it off to hand over the terminal instead
 - **Agent threads** — a session can take part in a GitHub issue, PR, or discussion, and be woken when somebody replies
 - **Rename** — rename sessions inline with `r`
 - **Safe cleanup** — delete TUI-created worktrees with dirty-worktree and unmerged-branch protection
@@ -322,10 +322,10 @@ When you resume a session, the TUI exits cleanly and launches `copilot --resume=
 
 ## Multiplexer
 
-By default CST is a launcher: it hands the terminal to Copilot and gets out of the way. Enable
-the multiplexer and it instead becomes a tmux-like host — sessions run in PTY-backed panes
-*inside* CST, so several can stay alive in a single terminal window and you can flip between
-them and the session list without ever leaving the TUI.
+By default CST is a tmux-like host: sessions run in PTY-backed panes *inside* CST, so several
+can stay alive in a single terminal window and you can flip between them and the session
+list without ever leaving the TUI. Turn the multiplexer off and CST is a launcher instead: it
+hands the terminal to Copilot and gets out of the way.
 
 ```json
 {
@@ -334,9 +334,15 @@ them and the session list without ever leaving the TUI.
 }
 ```
 
+Every config CST has saved records `mux` explicitly, so upgrading keeps whichever mode it
+says. Only a config without a `mux` key — a new install, or a file written by hand — gets
+the multiplexer by default.
+
 Toggle it from global settings (`,`), or override it for one invocation with `--mux` /
-`--no-mux`. The setting takes effect the next time CST starts; a CLI override is never
-written back to the config file.
+`--no-mux`. Toggling takes effect straight away, with one exception: turning it off while
+sessions are open in tabs waits until the last tab is closed, because those sessions run
+inside CST and would otherwise end with it. A CLI override is never written back to the
+config file, and toggling in settings replaces it for the rest of that run.
 
 While attached to a session, every keystroke goes to Copilot except the prefix key:
 
@@ -891,8 +897,9 @@ value and means autopilot never continues on its own.
 
 Running CST instances watch the global `config.json` and adopt changes made by another
 instance or an external editor without restarting. Notification routing and credentials
-are refreshed again immediately before each notification is queued. The current mux/non-mux mode remains
-fixed for the lifetime of a process, but a changed mux prefix takes effect live. Reload is
+are refreshed again immediately before each notification is queued. A changed mux prefix
+takes effect live, but a changed `mux` does not: each instance only switches mode when it is
+toggled in that instance's own settings, so one window never rearranges another. Reload is
 deferred while Global Settings is open so unsaved input is not overwritten; invalid JSON
 leaves the last known-good runtime configuration active and reports an error. A temporarily
 missing file is also ignored instead of resetting a running instance to defaults.

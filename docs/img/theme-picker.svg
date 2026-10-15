@@ -18,12 +18,12 @@
 <rect x="277.0" y="268.0" width="594.0" height="18.0" fill="#ccd0da" shape-rendering="crispEdges"/>
 <rect x="277.0" y="286.0" width="594.0" height="18.0" fill="#ccd0da" shape-rendering="crispEdges"/>
 <rect x="277.0" y="304.0" width="594.0" height="18.0" fill="#ccd0da" shape-rendering="crispEdges"/>
-<rect x="214.0" y="322.0" width="63.0" height="18.0" fill="#8839ef" shape-rendering="crispEdges"/>
 <rect x="277.0" y="322.0" width="594.0" height="18.0" fill="#ccd0da" shape-rendering="crispEdges"/>
 <rect x="277.0" y="340.0" width="594.0" height="18.0" fill="#ccd0da" shape-rendering="crispEdges"/>
 <rect x="277.0" y="358.0" width="9.0" height="18.0" fill="#ccd0da" shape-rendering="crispEdges"/>
 <rect x="286.0" y="358.0" width="306.0" height="18.0" fill="#8839ef" shape-rendering="crispEdges"/>
 <rect x="592.0" y="358.0" width="279.0" height="18.0" fill="#ccd0da" shape-rendering="crispEdges"/>
+<rect x="214.0" y="376.0" width="63.0" height="18.0" fill="#8839ef" shape-rendering="crispEdges"/>
 <rect x="277.0" y="376.0" width="594.0" height="18.0" fill="#ccd0da" shape-rendering="crispEdges"/>
 <rect x="277.0" y="394.0" width="594.0" height="18.0" fill="#ccd0da" shape-rendering="crispEdges"/>
 <rect x="277.0" y="412.0" width="594.0" height="18.0" fill="#ccd0da" shape-rendering="crispEdges"/>
@@ -156,8 +156,8 @@
 <text x="1123.0" y="317.5" fill="#64677c" textLength="9.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <text x="16.0" y="335.5" fill="#64677c" textLength="9.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <text x="25.0" y="335.5" fill="#4c4f69" textLength="180.0" lengthAdjust="spacing" xml:space="preserve">    notes           </text>
-<text x="205.0" y="335.5" fill="#8839ef" textLength="9.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
-<text x="214.0" y="335.5" fill="#f8f8f2" textLength="63.0" lengthAdjust="spacing" font-weight="bold" xml:space="preserve">▸ Theme</text>
+<text x="205.0" y="335.5" fill="#8839ef" textLength="27.0" lengthAdjust="spacing" xml:space="preserve">│  </text>
+<text x="232.0" y="335.5" fill="#4c4f69" textLength="45.0" lengthAdjust="spacing" xml:space="preserve">Max A</text>
 <text x="277.0" y="335.5" fill="#179299" textLength="9.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <text x="862.0" y="335.5" fill="#179299" textLength="9.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <text x="925.0" y="335.5" fill="#8839ef" textLength="9.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
@@ -165,7 +165,7 @@
 <text x="16.0" y="353.5" fill="#64677c" textLength="9.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <text x="25.0" y="353.5" fill="#4c4f69" textLength="180.0" lengthAdjust="spacing" xml:space="preserve">    Replace the sett</text>
 <text x="205.0" y="353.5" fill="#8839ef" textLength="9.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
-<text x="214.0" y="353.5" fill="#64677c" textLength="63.0" lengthAdjust="spacing" xml:space="preserve">    Pre</text>
+<text x="214.0" y="353.5" fill="#64677c" textLength="63.0" lengthAdjust="spacing" xml:space="preserve">    Bla</text>
 <text x="277.0" y="353.5" fill="#179299" textLength="9.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <text x="286.0" y="353.5" fill="#8839ef" textLength="63.0" lengthAdjust="spacing" font-weight="bold" xml:space="preserve">  Light</text>
 <text x="862.0" y="353.5" fill="#179299" textLength="9.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
@@ -182,6 +182,7 @@
 <text x="16.0" y="389.5" fill="#64677c" textLength="9.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <text x="25.0" y="389.5" fill="#4c4f69" textLength="180.0" lengthAdjust="spacing" xml:space="preserve">    Audit bundle siz</text>
 <text x="205.0" y="389.5" fill="#8839ef" textLength="9.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="214.0" y="389.5" fill="#f8f8f2" textLength="63.0" lengthAdjust="spacing" font-weight="bold" xml:space="preserve">▸ Theme</text>
 <text x="277.0" y="389.5" fill="#179299" textLength="9.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <text x="286.0" y="389.5" fill="#4c4f69" textLength="576.0" lengthAdjust="spacing" xml:space="preserve">    Solarized Light                                             </text>
 <text x="862.0" y="389.5" fill="#179299" textLength="9.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
@@ -190,6 +191,7 @@
 <text x="16.0" y="407.5" fill="#64677c" textLength="9.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <text x="25.0" y="407.5" fill="#4c4f69" textLength="180.0" lengthAdjust="spacing" xml:space="preserve">    acme-web        </text>
 <text x="205.0" y="407.5" fill="#8839ef" textLength="9.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="214.0" y="407.5" fill="#64677c" textLength="63.0" lengthAdjust="spacing" xml:space="preserve">    Pre</text>
 <text x="277.0" y="407.5" fill="#179299" textLength="9.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <text x="862.0" y="407.5" fill="#179299" textLength="9.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <text x="925.0" y="407.5" fill="#8839ef" textLength="9.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
