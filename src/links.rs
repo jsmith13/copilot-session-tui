@@ -11,9 +11,16 @@
 //! to the program underneath, so doing both gives every click two browser tabs.
 //!
 //! A file link is CST's to handle, and it never launches the file: it opens the folder with
-//! the file selected. That keeps a link to an `.exe` or a `.ps1` from running anything
-//! while leaving the user a double-click away from the `.html` they wanted. It is never
-//! handed to the terminal, which would open it with whatever the file type launches.
+//! the file selected. That keeps a link to an `.exe` or a `.ps1` from running anything. It
+//! is never handed to the terminal, which would open it with whatever the file type
+//! launches.
+//!
+//! The one exception is an HTML page, which opens in the browser. Agents write reports and
+//! previews as `.html` and link to them, and revealing those only made the user
+//! double-click the file CST had just selected. A page runs inside the browser's sandbox,
+//! the same place a web link already lands, so opening one gives an agent nothing a web
+//! link does not. The test is the exact extension, so `.hta` — which Windows runs as a
+//! program — is still only revealed.
 //!
 //! Every other scheme is refused outright — `ms-settings:`, `vscode:` and friends are
 //! handlers that act on a click, and nothing an agent printed should be able to reach them.
@@ -34,7 +41,8 @@ use std::process::Command;
 pub enum Target {
     /// An `http` or `https` address, drawn as a hyperlink for the terminal to open.
     Web(String),
-    /// A file or folder, revealed in the file manager and never launched.
+    /// A file or folder, revealed in the file manager — or, for an HTML page, opened in
+    /// the browser. Never otherwise launched.
     File(PathBuf),
 }
 
@@ -118,6 +126,95 @@ pub fn running_over_ssh(is_set: impl Fn(&str) -> bool) -> bool {
     ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"]
         .into_iter()
         .any(is_set)
+}
+
+/// Whether a file link may be opened in the browser rather than revealed.
+pub fn is_web_page(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("html") || extension.eq_ignore_ascii_case("htm")
+        })
+}
+
+/// Whether this file link opens in the browser — an existing page, not a folder that
+/// happens to be called `x.html`, which a browser would only list.
+fn opens_in_browser(path: &Path) -> bool {
+    is_web_page(path) && path.is_file()
+}
+
+/// Open a file link: an HTML page in the browser, anything else revealed in its folder.
+pub fn open_file(path: &Path) -> Result<()> {
+    if opens_in_browser(path) {
+        open_with_default_app(path)
+    } else {
+        reveal(path)
+    }
+}
+
+/// Open a file with whatever its type is associated with.
+///
+/// Only ever called for an HTML page; the association is the user's browser unless they
+/// chose otherwise, and what they chose is what they expect a page to open in.
+///
+/// Not through Explorer, as revealing is: Explorer splits its command line on commas even
+/// inside quotes, so a page under `a b,c\` silently never opened. `ShellExecuteW` takes the
+/// path as a string with nothing to parse. It does block until the handler has started.
+#[cfg(windows)]
+fn open_with_default_app(path: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::System::Com::{
+        CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+    };
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let wide = |text: &std::ffi::OsStr| -> Vec<u16> { text.encode_wide().chain([0]).collect() };
+    let verb = wide("open".as_ref());
+    let file = wide(path.as_os_str());
+    // A handler may be a COM shell extension, which needs COM set up on the calling thread.
+    // A thread of its own keeps that from changing the UI thread's apartment under
+    // anything else that uses COM there, like the clipboard.
+    let result = std::thread::spawn(move || unsafe {
+        let initialized = CoInitializeEx(
+            std::ptr::null(),
+            (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32,
+        );
+        let instance = ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        );
+        if initialized >= 0 {
+            CoUninitialize();
+        }
+        // Anything above 32 is success; at or below it is an error code.
+        instance as isize
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("Could not open the browser"))?;
+    if result <= 32 {
+        bail!("Could not open the browser (error {result})");
+    }
+    Ok(())
+}
+
+/// Open a file with whatever its type is associated with. See the Windows version.
+#[cfg(not(windows))]
+fn open_with_default_app(path: &Path) -> Result<()> {
+    let program = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    Command::new(program)
+        .arg(path)
+        .spawn()
+        .context("Could not open the browser")?;
+    Ok(())
 }
 
 /// Show a file selected in its folder, without ever launching it.
@@ -258,12 +355,62 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn an_executable_is_still_only_ever_revealed() {
-        // Classified as a file like any other — and files are revealed, never launched.
-        // The distinction lives in `open`, which has no path that runs a file.
+        // Classified as a file like any other, and not a web page — so `open_file` reveals
+        // it, the only thing it does with a file that is not one.
         assert_eq!(
             classify("file:///C:/Windows/System32/calc.exe"),
             Some(Target::File(PathBuf::from(r"C:\Windows\System32\calc.exe")))
         );
+        assert!(!opens_in_browser(Path::new(
+            r"C:\Windows\System32\calc.exe"
+        )));
+    }
+
+    #[test]
+    fn an_html_page_opens_in_the_browser_because_revealing_it_only_added_a_double_click() {
+        for name in ["report.html", "index.htm", "PREVIEW.HTML", "My View.Htm"] {
+            assert!(is_web_page(Path::new(name)), "{name} should open");
+        }
+    }
+
+    #[test]
+    fn only_the_exact_html_extensions_open_because_anything_else_could_run_as_a_program() {
+        // `.hta` is HTML that Windows runs as a trusted application, outside any browser.
+        for name in [
+            "app.hta",
+            "run.exe",
+            "script.ps1",
+            "shortcut.lnk",
+            "page.html.exe",
+            "page.xhtml",
+            "page.shtml",
+            "html",
+            ".html",
+        ] {
+            assert!(
+                !is_web_page(Path::new(name)),
+                "{name} must only be revealed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_folder_named_like_a_page_is_revealed_because_a_browser_would_only_list_it() {
+        let folder = tempfile::Builder::new()
+            .suffix(".html")
+            .tempdir()
+            .expect("temporary folder");
+        assert!(!opens_in_browser(folder.path()));
+
+        let page = folder.path().join("report.html");
+        std::fs::write(&page, "<p>hi</p>").expect("page");
+        assert!(opens_in_browser(&page));
+    }
+
+    #[test]
+    fn a_missing_page_is_revealed_so_the_click_still_shows_its_folder() {
+        let folder = tempfile::tempdir().expect("temporary folder");
+        assert!(!opens_in_browser(&folder.path().join("gone.html")));
     }
 
     #[cfg(not(windows))]
@@ -276,22 +423,24 @@ mod tests {
         assert_eq!(classify("file://elsewhere/x.html"), None);
     }
 
-    /// Hands a real file to the real file manager.
+    /// Hands a real file to the real file manager, or a real page to the real browser.
     ///
     /// Everything else here runs with launching compiled out, so this is the only proof the
-    /// command line itself is right — Explorer's `/select,` in particular, which has to be
+    /// launches themselves are right — Explorer's `/select,` in particular, which has to be
     /// built by hand. Aim it at a script that leaves a marker behind if it ever runs: the
-    /// point of revealing rather than opening is that the marker never appears.
+    /// point of revealing rather than opening is that the marker never appears. Aim it at an
+    /// `.html` in a folder whose name has a space and a comma, and the page itself should
+    /// open — Explorer could not do that, which is why pages do not go through it.
     #[test]
-    #[ignore = "opens a file manager window; run with CST_LINKS_LIVE_FILE=<path>"]
-    fn a_file_link_really_reveals_the_file() {
+    #[ignore = "opens a file manager or browser window; run with CST_LINKS_LIVE_FILE=<path>"]
+    fn a_file_link_really_opens_a_page_or_reveals_anything_else() {
         let Ok(path) = std::env::var("CST_LINKS_LIVE_FILE") else {
             return;
         };
         let Some(Target::File(path)) = classify(&path) else {
             panic!("{path} is not a file link");
         };
-        reveal(&path).expect("the file manager should start");
+        open_file(&path).expect("the file manager or browser should start");
     }
 
     #[test]

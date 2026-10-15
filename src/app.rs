@@ -1998,8 +1998,8 @@ impl App {
 
     /// Open a link a pane showed, within what a click is allowed to do.
     ///
-    /// See [`crate::links`] for why a file is revealed rather than launched and why every
-    /// scheme but the web is refused.
+    /// See [`crate::links`] for why a file is revealed rather than launched, why an HTML
+    /// page is the exception, and why every scheme but the web is refused.
     pub fn open_link(&mut self, raw: &str) {
         let target = match crate::links::classify(raw) {
             None => {
@@ -2026,7 +2026,7 @@ impl App {
             self.opened_links.push(crate::links::Target::File(target));
         }
         #[cfg(not(test))]
-        if let Err(error) = crate::links::reveal(&target) {
+        if let Err(error) = crate::links::open_file(&target) {
             self.status_message = Some(format!("Could not open link: {error}"));
         }
     }

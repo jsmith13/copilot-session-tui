@@ -52,6 +52,10 @@ pulldown-cmark = { version = "0.13", default-features = false }
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
+    # Opening an HTML link in the browser: Explorer cannot take a path with a comma.
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [target.'cfg(unix)'.dependencies]
