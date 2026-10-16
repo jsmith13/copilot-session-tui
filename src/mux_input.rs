@@ -3742,15 +3742,14 @@ mod tests {
         let _ = app.mux.as_mut().unwrap().shutdown();
     }
 
-    #[test]
-    fn copilot_redrawing_an_empty_prompt_after_control_backspace_clears_an_offscreen_draft() {
+    fn assert_control_clear_repaints_offscreen(code: char) {
         let mut app = split_app(3);
         handle_attached_event(&mut app, Event::Paste("one word".to_string()));
         assert!(app.mux.as_ref().unwrap().pane(2).unwrap().has_draft());
 
         handle_attached_event(
             &mut app,
-            Event::Key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)),
+            Event::Key(KeyEvent::new(KeyCode::Char(code), KeyModifiers::CONTROL)),
         );
         handle_attached_event(
             &mut app,
@@ -3776,6 +3775,16 @@ mod tests {
             "the rendered empty composer is authoritative after deletion"
         );
         let _ = app.mux.as_mut().unwrap().shutdown();
+    }
+
+    #[test]
+    fn copilot_redrawing_an_empty_prompt_after_control_backspace_clears_an_offscreen_draft() {
+        assert_control_clear_repaints_offscreen('w');
+    }
+
+    #[test]
+    fn copilot_redrawing_an_empty_prompt_after_control_c_clears_an_offscreen_draft() {
+        assert_control_clear_repaints_offscreen('c');
     }
 
     fn press_attached(app: &mut App, code: KeyCode) {

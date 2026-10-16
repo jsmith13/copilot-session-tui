@@ -539,7 +539,7 @@ impl Pane {
             || matches!(
                 key,
                 crossterm::event::KeyEvent {
-                    code: KeyCode::Char('w' | 'u' | 'k' | 'd'),
+                    code: KeyCode::Char('c' | 'w' | 'u' | 'k' | 'd'),
                     modifiers,
                     ..
                 } if modifiers.contains(KeyModifiers::CONTROL)
