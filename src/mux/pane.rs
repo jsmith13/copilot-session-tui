@@ -1474,11 +1474,11 @@ fn composer_is_empty_at_cursor(screen: &vt100::Screen) -> bool {
         .rev()
         .find(|column| cursor_line[usize::from(*column)] == '│')
     else {
-        return false;
+        return separator_framed_composer_is_empty(screen, cursor_row, rows, cols);
     };
     let Some(right) = (cursor_col..cols).find(|column| cursor_line[usize::from(*column)] == '│')
     else {
-        return false;
+        return separator_framed_composer_is_empty(screen, cursor_row, rows, cols);
     };
     if right <= left + 2 {
         return false;
@@ -1497,15 +1497,61 @@ fn composer_is_empty_at_cursor(screen: &vt100::Screen) -> bool {
         return false;
     };
 
+    composer_region_is_empty(screen, top, bottom, left + 1, right, cols)
+}
+
+fn separator_framed_composer_is_empty(
+    screen: &vt100::Screen,
+    cursor_row: u16,
+    rows: u16,
+    cols: u16,
+) -> bool {
+    let Some(top) = (0..cursor_row)
+        .rev()
+        .find(|row| row_is_horizontal_separator(screen, *row, cols))
+    else {
+        return false;
+    };
+    let Some(bottom) =
+        (cursor_row + 1..rows).find(|row| row_is_horizontal_separator(screen, *row, cols))
+    else {
+        return false;
+    };
+    composer_region_is_empty(screen, top, bottom, 0, cols, cols)
+}
+
+fn row_is_horizontal_separator(screen: &vt100::Screen, row: u16, cols: u16) -> bool {
+    let line = row_characters(screen, row, cols);
+    let mut separators = 0;
+    for character in line
+        .into_iter()
+        .filter(|character| !character.is_whitespace())
+    {
+        if character != '─' {
+            return false;
+        }
+        separators += 1;
+    }
+    separators >= 8
+}
+
+fn composer_region_is_empty(
+    screen: &vt100::Screen,
+    top: u16,
+    bottom: u16,
+    start: u16,
+    end: u16,
+    cols: u16,
+) -> bool {
     let mut prompt_marker = false;
     for row in top + 1..bottom {
         let line = row_characters(screen, row, cols);
-        for column in left + 1..right {
+        for column in start..end {
             let character = line[usize::from(column)];
             if character.is_whitespace() {
                 continue;
             }
-            if row == top + 1 && character == '>' && !prompt_marker {
+            if row == top + 1 && matches!(character, '>' | '❯') && !prompt_marker {
                 prompt_marker = true;
                 continue;
             }
@@ -1685,7 +1731,7 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_copilot_prompt_box_is_recognized_at_the_cursor() {
+    fn an_empty_rounded_copilot_prompt_is_recognized_at_the_cursor() {
         let mut parser = vt100::Parser::new(4, 20, 0);
         parser.process("╭────────╮\r\n│ >      │\r\n╰────────╯\x1b[2;4H".as_bytes());
 
@@ -1693,12 +1739,23 @@ mod tests {
     }
 
     #[test]
-    fn prompt_text_or_a_literal_greater_than_sign_is_not_an_empty_box() {
-        let mut parser = vt100::Parser::new(4, 20, 0);
-        parser.process("╭────────╮\r\n│ > text │\r\n╰────────╯\x1b[2;4H".as_bytes());
+    fn an_empty_separator_framed_copilot_prompt_is_recognized_at_the_cursor() {
+        let mut parser = vt100::Parser::new(4, 24, 0);
+        parser.process("────────────────────\r\n❯ \r\n────────────────────\x1b[2;3H".as_bytes());
+
+        assert!(composer_is_empty_at_cursor(parser.screen()));
+    }
+
+    #[test]
+    fn prompt_text_or_a_literal_prompt_marker_is_not_an_empty_composer() {
+        let mut parser = vt100::Parser::new(4, 24, 0);
+        parser
+            .process("────────────────────\r\n❯ text\r\n────────────────────\x1b[2;3H".as_bytes());
         assert!(!composer_is_empty_at_cursor(parser.screen()));
 
-        parser.process("\x1b[2J\x1b[H╭────────╮\r\n│ > >    │\r\n╰────────╯\x1b[2;4H".as_bytes());
+        parser.process(
+            "\x1b[2J\x1b[H────────────────────\r\n❯ ❯\r\n────────────────────\x1b[2;3H".as_bytes(),
+        );
         assert!(!composer_is_empty_at_cursor(parser.screen()));
     }
 

@@ -3761,7 +3761,9 @@ mod tests {
             .unwrap()
             .pane_mut(2)
             .unwrap()
-            .feed_synthetic("╭────────╮\r\n│ >      │\r\n╰────────╯\x1b[2;4H".as_bytes());
+            .feed_synthetic(
+                "────────────────────\r\n❯ \r\n────────────────────\x1b[2;3H".as_bytes(),
+            );
 
         assert!(
             handle_mux_event(&mut app, MuxEvent::Output(2, Default::default())),
