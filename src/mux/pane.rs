@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::events::hooks::{HookAttention, HookLifecycleEvent, HookMonitor};
 use crate::events::lifecycle::{InputKind, LifecycleEvent, LifecycleMonitor};
@@ -471,6 +472,19 @@ impl Pane {
         self.composer_occupancy = ComposerOccupancy::Unknown;
     }
 
+    fn note_linear_characters(&mut self, added: usize) {
+        if added == 0 {
+            return;
+        }
+        self.composer_occupancy = match self.composer_occupancy {
+            ComposerOccupancy::Empty => ComposerOccupancy::Linear(added),
+            ComposerOccupancy::Linear(count) => {
+                ComposerOccupancy::Linear(count.saturating_add(added))
+            }
+            ComposerOccupancy::Unknown => ComposerOccupancy::Unknown,
+        };
+    }
+
     /// Note a key on its way to the child, to track whether a draft is being composed.
     ///
     /// While the user only types at the end, CST knows how many characters are present
@@ -493,11 +507,7 @@ impl Pane {
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
         if plain_character {
-            self.composer_occupancy = match self.composer_occupancy {
-                ComposerOccupancy::Empty => ComposerOccupancy::Linear(1),
-                ComposerOccupancy::Linear(count) => ComposerOccupancy::Linear(count + 1),
-                ComposerOccupancy::Unknown => ComposerOccupancy::Unknown,
-            };
+            self.note_linear_characters(1);
             return;
         }
 
@@ -1200,9 +1210,7 @@ impl Pane {
             return Ok(());
         }
         self.return_to_live_screen();
-        if !text.is_empty() {
-            self.composer_occupancy = ComposerOccupancy::Unknown;
-        }
+        self.note_linear_characters(text.graphemes(true).count());
         let bytes = keys::encode_paste(text, self.bracketed_paste());
         match &mut self.pty {
             Some(pty) => pty.write(&bytes),
@@ -1234,7 +1242,7 @@ impl Pane {
                 "Copilot is not ready for multiline paste yet; wait for startup to finish"
             );
         }
-        self.composer_occupancy = ComposerOccupancy::Unknown;
+        self.note_linear_characters(text.graphemes(true).count());
         let bytes = keys::encode_paste(text, bracketed);
         match &mut self.pty {
             Some(pty) => pty.write(&bytes),
@@ -1958,6 +1966,14 @@ mod tests {
         assert!(
             pane.has_draft(),
             "cursor movement makes the remaining text uncertain"
+        );
+        pane.send_paste("ello").unwrap();
+        for _ in 0..5 {
+            pane.note_user_key(&key(KeyCode::Backspace));
+        }
+        assert!(
+            pane.has_draft(),
+            "a paste cannot restore an exact count after ambiguous editing"
         );
         pane.note_user_key(&crossterm::event::KeyEvent::new(
             KeyCode::Enter,

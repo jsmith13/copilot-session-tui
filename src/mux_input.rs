@@ -3710,6 +3710,34 @@ mod tests {
         let _ = app.mux.as_mut().unwrap().shutdown();
     }
 
+    #[test]
+    fn deleting_all_pasted_prompt_text_clears_the_draft_before_switching_tabs() {
+        let mut app = split_app(3);
+        assert_eq!(app.mux.as_ref().unwrap().focused, Some(2));
+
+        handle_attached_event(&mut app, Event::Paste("x👨‍👩‍👧‍👦".to_string()));
+        assert!(app.mux.as_ref().unwrap().pane(2).unwrap().has_draft());
+
+        for _ in 0..2 {
+            handle_attached_event(
+                &mut app,
+                Event::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+            );
+        }
+        handle_attached_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL)),
+        );
+
+        let mux = app.mux.as_ref().unwrap();
+        assert_eq!(mux.focused, Some(3), "the user navigated away");
+        assert!(
+            !mux.pane(2).unwrap().has_draft(),
+            "deleting the entire paste must clear the pencil"
+        );
+        let _ = app.mux.as_mut().unwrap().shutdown();
+    }
+
     fn press_attached(app: &mut App, code: KeyCode) {
         handle_attached_event(app, Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
     }
