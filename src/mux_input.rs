@@ -2719,6 +2719,7 @@ pub fn handle_mux_event(app: &mut App, event: MuxEvent) -> bool {
                 notifications,
                 attention_changed,
                 title_changed,
+                draft_changed,
                 cycle_started,
                 title,
                 session_id,
@@ -2731,11 +2732,13 @@ pub fn handle_mux_event(app: &mut App, event: MuxEvent) -> bool {
                     let title_before = pane.title.clone();
                     let cycle_started = signals_start_cycle(pane.is_working(), &signals.events);
                     let (outcome, notifications) = pane.apply_signals(signals, attended);
+                    let draft_changed = pane.clear_draft_if_composer_empty();
                     (
                         outcome,
                         notifications,
                         before != pane.needs_attention(),
                         title_before != pane.title,
+                        draft_changed,
                         cycle_started,
                         pane.title.clone(),
                         pane.session_id.clone(),
@@ -2770,6 +2773,7 @@ pub fn handle_mux_event(app: &mut App, event: MuxEvent) -> bool {
                 || outcome.bell
                 || attention_changed
                 || title_changed
+                || draft_changed
                 || notification_changed
         }
         MuxEvent::WorktreeReady(id, outcome) => {
@@ -3734,6 +3738,40 @@ mod tests {
         assert!(
             !mux.pane(2).unwrap().has_draft(),
             "deleting the entire paste must clear the pencil"
+        );
+        let _ = app.mux.as_mut().unwrap().shutdown();
+    }
+
+    #[test]
+    fn copilot_redrawing_an_empty_prompt_after_control_backspace_clears_an_offscreen_draft() {
+        let mut app = split_app(3);
+        handle_attached_event(&mut app, Event::Paste("one word".to_string()));
+        assert!(app.mux.as_ref().unwrap().pane(2).unwrap().has_draft());
+
+        handle_attached_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)),
+        );
+        handle_attached_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL)),
+        );
+        app.mux
+            .as_mut()
+            .unwrap()
+            .pane_mut(2)
+            .unwrap()
+            .feed_synthetic("╭────────╮\r\n│ >      │\r\n╰────────╯\x1b[2;4H".as_bytes());
+
+        assert!(
+            handle_mux_event(&mut app, MuxEvent::Output(2, Default::default())),
+            "clearing an offscreen marker must repaint the tab strip"
+        );
+        let mux = app.mux.as_ref().unwrap();
+        assert_eq!(mux.focused, Some(3), "the user already navigated away");
+        assert!(
+            !mux.pane(2).unwrap().has_draft(),
+            "the rendered empty composer is authoritative after deletion"
         );
         let _ = app.mux.as_mut().unwrap().shutdown();
     }

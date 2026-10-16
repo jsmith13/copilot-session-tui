@@ -94,6 +94,9 @@ pub struct Pane {
     /// Anything that makes the count uncertain falls back to a sticky occupied state,
     /// cleared only by a submit or a turn starting.
     composer_occupancy: ComposerOccupancy,
+    /// A destructive edit was sent and a Copilot redraw may prove the composer empty
+    /// even when key counting could not.
+    composer_empty_check_pending: bool,
 
     working: bool,
     progress_state: crate::host_terminal::ProgressState,
@@ -276,6 +279,7 @@ impl Pane {
                 cols: size.cols,
             },
             composer_occupancy: ComposerOccupancy::Empty,
+            composer_empty_check_pending: false,
             working: false,
             progress_state: crate::host_terminal::ProgressState::Clear,
             raw_progress_generation: 0,
@@ -470,12 +474,14 @@ impl Pane {
     /// one message containing the same notice several times over.
     pub fn note_injection(&mut self) {
         self.composer_occupancy = ComposerOccupancy::Unknown;
+        self.composer_empty_check_pending = false;
     }
 
     fn note_linear_characters(&mut self, added: usize) {
         if added == 0 {
             return;
         }
+        self.composer_empty_check_pending = false;
         self.composer_occupancy = match self.composer_occupancy {
             ComposerOccupancy::Empty => ComposerOccupancy::Linear(added),
             ComposerOccupancy::Linear(count) => {
@@ -499,6 +505,7 @@ impl Pane {
         // only the bare one means the composer is now empty.
         if key.code == KeyCode::Enter && key.modifiers == KeyModifiers::NONE {
             self.composer_occupancy = ComposerOccupancy::Empty;
+            self.composer_empty_check_pending = false;
             return;
         }
 
@@ -516,12 +523,29 @@ impl Pane {
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
         {
+            self.composer_empty_check_pending = self.has_draft();
             self.composer_occupancy = match self.composer_occupancy {
                 ComposerOccupancy::Linear(1) => ComposerOccupancy::Empty,
                 ComposerOccupancy::Linear(count) => ComposerOccupancy::Linear(count - 1),
                 occupancy => occupancy,
             };
+            if !self.has_draft() {
+                self.composer_empty_check_pending = false;
+            }
             return;
+        }
+
+        let destructive_command = matches!(key.code, KeyCode::Backspace | KeyCode::Delete)
+            || matches!(
+                key,
+                crossterm::event::KeyEvent {
+                    code: KeyCode::Char('w' | 'u' | 'k' | 'd'),
+                    modifiers,
+                    ..
+                } if modifiers.contains(KeyModifiers::CONTROL)
+            );
+        if destructive_command {
+            self.composer_empty_check_pending = self.has_draft();
         }
 
         match key.code {
@@ -531,6 +555,7 @@ impl Pane {
             // safely infer across Copilot versions.
             KeyCode::Tab | KeyCode::Enter => {
                 self.composer_occupancy = ComposerOccupancy::Unknown;
+                self.composer_empty_check_pending = false;
             }
             // Commands, navigation, and other editing make the known cursor position
             // uncertain. Keep an existing draft, but never invent one from an empty box.
@@ -539,6 +564,26 @@ impl Pane {
             }
             _ => {}
         }
+    }
+
+    /// Clear a draft only when a deletion is followed by Copilot drawing an empty prompt.
+    ///
+    /// Key encodings vary by terminal — Ctrl+Backspace is Ctrl+W in common setups — and
+    /// one key can remove a whole word. The rendered composer is authoritative after
+    /// such edits, but is consulted only while a clear is pending so a stale empty frame
+    /// cannot erase a character CST has just sent.
+    pub fn clear_draft_if_composer_empty(&mut self) -> bool {
+        if !self.composer_empty_check_pending || !self.has_draft() {
+            return false;
+        }
+        let empty = self
+            .with_screen(composer_is_empty_at_cursor)
+            .unwrap_or(false);
+        if empty {
+            self.composer_occupancy = ComposerOccupancy::Empty;
+            self.composer_empty_check_pending = false;
+        }
+        empty
     }
 
     pub fn is_working(&self) -> bool {
@@ -973,6 +1018,7 @@ impl Pane {
                 // the authoritative clear: it catches a message submitted by a route CST
                 // never saw, such as a mouse click or a paste that ends in a newline.
                 self.composer_occupancy = ComposerOccupancy::Empty;
+                self.composer_empty_check_pending = false;
                 self.hook_state = Some(HookActivity::Working);
                 self.hook_waiting = None;
                 self.hook_ready_pending = None;
@@ -1256,6 +1302,7 @@ impl Pane {
         }
         if self.has_draft() {
             self.composer_occupancy = ComposerOccupancy::Unknown;
+            self.composer_empty_check_pending = false;
         }
         let Some((mode, encoding)) = self.with_screen(|screen| {
             (
@@ -1413,6 +1460,59 @@ fn current_timestamp() -> u64 {
         .unwrap_or_default()
         .as_millis()
         .min(u128::from(u64::MAX)) as u64
+}
+
+fn composer_is_empty_at_cursor(screen: &vt100::Screen) -> bool {
+    let (rows, cols) = screen.size();
+    let (cursor_row, cursor_col) = screen.cursor_position();
+    if rows == 0 || cols == 0 || cursor_row >= rows || cursor_col >= cols {
+        return false;
+    }
+
+    let cursor_line = row_characters(screen, cursor_row, cols);
+    let Some(left) = (0..=cursor_col)
+        .rev()
+        .find(|column| cursor_line[usize::from(*column)] == '│')
+    else {
+        return false;
+    };
+    let Some(right) = (cursor_col..cols).find(|column| cursor_line[usize::from(*column)] == '│')
+    else {
+        return false;
+    };
+    if right <= left + 2 {
+        return false;
+    }
+
+    let Some(top) = (0..cursor_row).rev().find(|row| {
+        let line = row_characters(screen, *row, cols);
+        line[usize::from(left)] == '╭' && line[usize::from(right)] == '╮'
+    }) else {
+        return false;
+    };
+    let Some(bottom) = (cursor_row + 1..rows).find(|row| {
+        let line = row_characters(screen, *row, cols);
+        line[usize::from(left)] == '╰' && line[usize::from(right)] == '╯'
+    }) else {
+        return false;
+    };
+
+    let mut prompt_marker = false;
+    for row in top + 1..bottom {
+        let line = row_characters(screen, row, cols);
+        for column in left + 1..right {
+            let character = line[usize::from(column)];
+            if character.is_whitespace() {
+                continue;
+            }
+            if row == top + 1 && character == '>' && !prompt_marker {
+                prompt_marker = true;
+                continue;
+            }
+            return false;
+        }
+    }
+    prompt_marker
 }
 
 fn row_characters(screen: &vt100::Screen, row: u16, cols: u16) -> Vec<char> {
@@ -1582,6 +1682,24 @@ mod tests {
         parser.process(b"abc#12 x#9");
 
         assert!(github_references(parser.screen()).is_empty());
+    }
+
+    #[test]
+    fn an_empty_copilot_prompt_box_is_recognized_at_the_cursor() {
+        let mut parser = vt100::Parser::new(4, 20, 0);
+        parser.process("╭────────╮\r\n│ >      │\r\n╰────────╯\x1b[2;4H".as_bytes());
+
+        assert!(composer_is_empty_at_cursor(parser.screen()));
+    }
+
+    #[test]
+    fn prompt_text_or_a_literal_greater_than_sign_is_not_an_empty_box() {
+        let mut parser = vt100::Parser::new(4, 20, 0);
+        parser.process("╭────────╮\r\n│ > text │\r\n╰────────╯\x1b[2;4H".as_bytes());
+        assert!(!composer_is_empty_at_cursor(parser.screen()));
+
+        parser.process("\x1b[2J\x1b[H╭────────╮\r\n│ > >    │\r\n╰────────╯\x1b[2;4H".as_bytes());
+        assert!(!composer_is_empty_at_cursor(parser.screen()));
     }
 
     fn shell_command(script: &str) -> (String, Vec<String>) {
