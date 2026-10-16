@@ -81,7 +81,7 @@ pub struct Pane {
     /// without taking the parser lock, which the reader thread holds while parsing.
     scrolled_back: bool,
     viewport: Viewport,
-    /// Whether this pane's composer holds text that has not been consumed.
+    /// What CST knows about text in this pane's composer.
     ///
     /// CST cannot read Copilot's composer, so this is inferred: from the keys it
     /// forwards, and from anything it writes there itself. Both matter. Writing over a
@@ -89,9 +89,10 @@ pub struct Pane {
     /// Copilot has not picked up yet stacks them into one unreadable message, which is
     /// what a busy thread produced.
     ///
-    /// Deliberately sticky: set by anything that puts text there, cleared only by
-    /// evidence it is gone — a submit, or a turn starting.
-    composer_occupied: bool,
+    /// Linear typing is counted so deleting it all is evidence the composer is empty.
+    /// Anything that makes the count uncertain falls back to a sticky occupied state,
+    /// cleared only by a submit or a turn starting.
+    composer_occupancy: ComposerOccupancy,
 
     working: bool,
     progress_state: crate::host_terminal::ProgressState,
@@ -130,6 +131,13 @@ enum HookActivity {
     Idle,
     Working,
     Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposerOccupancy {
+    Empty,
+    Linear(usize),
+    Unknown,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -266,7 +274,7 @@ impl Pane {
                 rows: size.rows,
                 cols: size.cols,
             },
-            composer_occupied: false,
+            composer_occupancy: ComposerOccupancy::Empty,
             working: false,
             progress_state: crate::host_terminal::ProgressState::Clear,
             raw_progress_generation: 0,
@@ -450,7 +458,7 @@ impl Pane {
 
     /// Whether this pane's composer holds text nobody has sent yet.
     pub fn has_draft(&self) -> bool {
-        self.composer_occupied
+        self.composer_occupancy != ComposerOccupancy::Empty
     }
 
     /// Note that CST has written into the composer itself.
@@ -460,42 +468,66 @@ impl Pane {
     /// second wake-up arriving then would stack onto the first, and the user would get
     /// one message containing the same notice several times over.
     pub fn note_injection(&mut self) {
-        self.composer_occupied = true;
+        self.composer_occupancy = ComposerOccupancy::Unknown;
     }
 
     /// Note a key on its way to the child, to track whether a draft is being composed.
     ///
-    /// Only a plain Enter clears it. Everything else that could be editing — backspace,
-    /// arrows, a newline chord — leaves the draft standing, because the cost of the two
-    /// mistakes is not symmetric. Believing in a draft that is not there delays a
-    /// wake-up; believing there is none when there is loses the user's words.
-    ///
-    /// That asymmetry argues for *keeping* a draft, not for inventing one. Backspace and
-    /// delete can only ever take text away, so they leave the flag exactly as they found
-    /// it: they neither start a draft nor prove one has ended. Treating them as typing
-    /// meant one stray backspace on an empty composer marked the tab `✎` and held any
-    /// thread notice for that session until it timed out and went to the inbox instead.
+    /// While the user only types at the end, CST knows how many characters are present
+    /// and a matching run of backspaces can prove they are all gone. Any operation that
+    /// could move the cursor or alter an unknown amount gives up that count and keeps the
+    /// draft sticky. Believing in a draft that is not there delays a wake-up; believing
+    /// there is none when there is loses the user's words.
     pub fn note_user_key(&mut self, key: &crossterm::event::KeyEvent) {
         use crossterm::event::{KeyCode, KeyModifiers};
 
         // Copilot submits on a bare Enter and inserts a newline for the chorded ones, so
         // only the bare one means the composer is now empty.
         if key.code == KeyCode::Enter && key.modifiers == KeyModifiers::NONE {
-            self.composer_occupied = false;
+            self.composer_occupancy = ComposerOccupancy::Empty;
             return;
         }
-        let composes = match key.code {
-            // A chord like Ctrl-C or Ctrl-L is a command, not typing.
-            KeyCode::Char(_) => !key
+
+        let plain_character = matches!(key.code, KeyCode::Char(_))
+            && !key
                 .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT),
-            // Tab stays: Copilot completes on it, which puts text there.
-            KeyCode::Enter | KeyCode::Tab => true,
-            // Backspace, delete, arrows, everything else: no new text, so no change.
-            _ => false,
-        };
-        if composes {
-            self.composer_occupied = true;
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        if plain_character {
+            self.composer_occupancy = match self.composer_occupancy {
+                ComposerOccupancy::Empty => ComposerOccupancy::Linear(1),
+                ComposerOccupancy::Linear(count) => ComposerOccupancy::Linear(count + 1),
+                ComposerOccupancy::Unknown => ComposerOccupancy::Unknown,
+            };
+            return;
+        }
+
+        if key.code == KeyCode::Backspace
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            self.composer_occupancy = match self.composer_occupancy {
+                ComposerOccupancy::Linear(1) => ComposerOccupancy::Empty,
+                ComposerOccupancy::Linear(count) => ComposerOccupancy::Linear(count - 1),
+                occupancy => occupancy,
+            };
+            return;
+        }
+
+        match key.code {
+            // At the end of known linear input, Delete cannot remove anything.
+            KeyCode::Delete if key.modifiers == KeyModifiers::NONE => {}
+            // Completion and a chorded newline put text there, but not an amount CST can
+            // safely infer across Copilot versions.
+            KeyCode::Tab | KeyCode::Enter => {
+                self.composer_occupancy = ComposerOccupancy::Unknown;
+            }
+            // Commands, navigation, and other editing make the known cursor position
+            // uncertain. Keep an existing draft, but never invent one from an empty box.
+            _ if self.has_draft() => {
+                self.composer_occupancy = ComposerOccupancy::Unknown;
+            }
+            _ => {}
         }
     }
 
@@ -930,7 +962,7 @@ impl Pane {
                 // A turn started, so whatever was being composed has been sent. This is
                 // the authoritative clear: it catches a message submitted by a route CST
                 // never saw, such as a mouse click or a paste that ends in a newline.
-                self.composer_occupied = false;
+                self.composer_occupancy = ComposerOccupancy::Empty;
                 self.hook_state = Some(HookActivity::Working);
                 self.hook_waiting = None;
                 self.hook_ready_pending = None;
@@ -1168,6 +1200,9 @@ impl Pane {
             return Ok(());
         }
         self.return_to_live_screen();
+        if !text.is_empty() {
+            self.composer_occupancy = ComposerOccupancy::Unknown;
+        }
         let bytes = keys::encode_paste(text, self.bracketed_paste());
         match &mut self.pty {
             Some(pty) => pty.write(&bytes),
@@ -1199,6 +1234,7 @@ impl Pane {
                 "Copilot is not ready for multiline paste yet; wait for startup to finish"
             );
         }
+        self.composer_occupancy = ComposerOccupancy::Unknown;
         let bytes = keys::encode_paste(text, bracketed);
         match &mut self.pty {
             Some(pty) => pty.write(&bytes),
@@ -1209,6 +1245,9 @@ impl Pane {
     pub fn handle_mouse(&mut self, event: MouseEvent) -> Result<bool> {
         if !self.is_running() {
             return Ok(false);
+        }
+        if self.has_draft() {
+            self.composer_occupancy = ComposerOccupancy::Unknown;
         }
         let Some((mode, encoding)) = self.with_screen(|screen| {
             (
@@ -1867,11 +1906,8 @@ mod tests {
     }
 
     #[test]
-    fn editing_keeps_the_draft_and_a_newline_chord_does_not_send_it() {
-        // Backspace could be clearing the last character or the whole message; CST
-        // cannot see which. It keeps the draft, because delaying a wake-up costs a
-        // little and overwriting what somebody wrote costs a lot.
-        use crossterm::event::{KeyCode, KeyModifiers};
+    fn deleting_every_linearly_typed_character_clears_the_draft() {
+        use crossterm::event::KeyCode;
         let (tx, _rx) = mpsc::channel();
         let (program, args) = shell_command(if cfg!(windows) {
             "ping -n 30 127.0.0.1 > nul"
@@ -1892,9 +1928,37 @@ mod tests {
         assert!(!pane.has_draft(), "nor can delete");
 
         pane.note_user_key(&key(KeyCode::Char('h')));
+        pane.note_user_key(&key(KeyCode::Char('i')));
         pane.note_user_key(&key(KeyCode::Backspace));
-        assert!(pane.has_draft(), "backspace is editing, not sending");
+        assert!(pane.has_draft(), "one typed character remains");
+        pane.note_user_key(&key(KeyCode::Backspace));
+        assert!(
+            !pane.has_draft(),
+            "deleting the whole known draft empties the composer"
+        );
+        pane.shutdown().unwrap();
+    }
 
+    #[test]
+    fn editing_after_cursor_movement_keeps_the_draft_conservatively() {
+        // Once the cursor moves, Backspace could remove a character from anywhere. CST
+        // keeps the draft because a false empty result would let a wake-up overwrite it.
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let (tx, _rx) = mpsc::channel();
+        let (program, args) = shell_command(if cfg!(windows) {
+            "ping -n 30 127.0.0.1 > nul"
+        } else {
+            "sleep 30"
+        });
+        let mut pane = Pane::spawn(test_spec(50, program, args), 24, 80, tx).unwrap();
+
+        pane.note_user_key(&key(KeyCode::Char('h')));
+        pane.note_user_key(&key(KeyCode::Left));
+        pane.note_user_key(&key(KeyCode::Backspace));
+        assert!(
+            pane.has_draft(),
+            "cursor movement makes the remaining text uncertain"
+        );
         pane.note_user_key(&crossterm::event::KeyEvent::new(
             KeyCode::Enter,
             KeyModifiers::CONTROL,
