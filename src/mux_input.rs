@@ -2719,6 +2719,7 @@ pub fn handle_mux_event(app: &mut App, event: MuxEvent) -> bool {
                 notifications,
                 attention_changed,
                 title_changed,
+                draft_changed,
                 cycle_started,
                 title,
                 session_id,
@@ -2731,11 +2732,13 @@ pub fn handle_mux_event(app: &mut App, event: MuxEvent) -> bool {
                     let title_before = pane.title.clone();
                     let cycle_started = signals_start_cycle(pane.is_working(), &signals.events);
                     let (outcome, notifications) = pane.apply_signals(signals, attended);
+                    let draft_changed = pane.clear_draft_if_composer_empty();
                     (
                         outcome,
                         notifications,
                         before != pane.needs_attention(),
                         title_before != pane.title,
+                        draft_changed,
                         cycle_started,
                         pane.title.clone(),
                         pane.session_id.clone(),
@@ -2770,6 +2773,7 @@ pub fn handle_mux_event(app: &mut App, event: MuxEvent) -> bool {
                 || outcome.bell
                 || attention_changed
                 || title_changed
+                || draft_changed
                 || notification_changed
         }
         MuxEvent::WorktreeReady(id, outcome) => {
@@ -3679,6 +3683,108 @@ mod tests {
             None
         );
         let _ = app.mux.as_mut().unwrap().shutdown();
+    }
+
+    #[test]
+    fn deleting_all_prompt_text_clears_the_draft_before_switching_tabs() {
+        let mut app = split_app(3);
+        assert_eq!(app.mux.as_ref().unwrap().focused, Some(2));
+
+        handle_attached_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+        );
+        assert!(app.mux.as_ref().unwrap().pane(2).unwrap().has_draft());
+
+        handle_attached_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+        );
+        handle_attached_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL)),
+        );
+
+        let mux = app.mux.as_ref().unwrap();
+        assert_eq!(mux.focused, Some(3), "the user navigated away");
+        assert!(
+            !mux.pane(2).unwrap().has_draft(),
+            "the abandoned empty prompt must not keep its pencil"
+        );
+        let _ = app.mux.as_mut().unwrap().shutdown();
+    }
+
+    #[test]
+    fn deleting_all_pasted_prompt_text_clears_the_draft_before_switching_tabs() {
+        let mut app = split_app(3);
+        assert_eq!(app.mux.as_ref().unwrap().focused, Some(2));
+
+        handle_attached_event(&mut app, Event::Paste("x👨‍👩‍👧‍👦".to_string()));
+        assert!(app.mux.as_ref().unwrap().pane(2).unwrap().has_draft());
+
+        for _ in 0..2 {
+            handle_attached_event(
+                &mut app,
+                Event::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+            );
+        }
+        handle_attached_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL)),
+        );
+
+        let mux = app.mux.as_ref().unwrap();
+        assert_eq!(mux.focused, Some(3), "the user navigated away");
+        assert!(
+            !mux.pane(2).unwrap().has_draft(),
+            "deleting the entire paste must clear the pencil"
+        );
+        let _ = app.mux.as_mut().unwrap().shutdown();
+    }
+
+    fn assert_control_clear_repaints_offscreen(code: char) {
+        let mut app = split_app(3);
+        handle_attached_event(&mut app, Event::Paste("one word".to_string()));
+        assert!(app.mux.as_ref().unwrap().pane(2).unwrap().has_draft());
+
+        handle_attached_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Char(code), KeyModifiers::CONTROL)),
+        );
+        handle_attached_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL)),
+        );
+        app.mux
+            .as_mut()
+            .unwrap()
+            .pane_mut(2)
+            .unwrap()
+            .feed_synthetic(
+                "────────────────────\r\n❯ \r\n────────────────────\x1b[2;3H".as_bytes(),
+            );
+
+        assert!(
+            handle_mux_event(&mut app, MuxEvent::Output(2, Default::default())),
+            "clearing an offscreen marker must repaint the tab strip"
+        );
+        let mux = app.mux.as_ref().unwrap();
+        assert_eq!(mux.focused, Some(3), "the user already navigated away");
+        assert!(
+            !mux.pane(2).unwrap().has_draft(),
+            "the rendered empty composer is authoritative after deletion"
+        );
+        let _ = app.mux.as_mut().unwrap().shutdown();
+    }
+
+    #[test]
+    fn copilot_redrawing_an_empty_prompt_after_control_backspace_clears_an_offscreen_draft() {
+        assert_control_clear_repaints_offscreen('w');
+    }
+
+    #[test]
+    fn copilot_redrawing_an_empty_prompt_after_control_c_clears_an_offscreen_draft() {
+        assert_control_clear_repaints_offscreen('c');
     }
 
     fn press_attached(app: &mut App, code: KeyCode) {

@@ -1415,7 +1415,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unsent_draft_is_marked_without_shifting_the_tab_title() {
+    fn an_unsent_draft_is_marked_and_deleting_it_clears_the_fixed_width_marker() {
         // A marker wider than two columns pushes every title along and invalidates click
         // hit-testing, which is why the cell is fixed. A new glyph is the way that gets
         // broken, so it is measured rather than assumed.
@@ -1434,6 +1434,20 @@ mod tests {
             "the draft glyph must occupy the same cell as every other marker"
         );
 
+        pane.note_user_key(&crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Backspace,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(
+            tab_marker(&pane),
+            "  ",
+            "removing all prompt text clears the pencil immediately"
+        );
+
+        pane.note_user_key(&crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('h'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
         // And it yields to anything the session actually wants from the user: a draft is
         // waiting on them to come back, not asking them for something.
         pane.apply_lifecycle(crate::events::lifecycle::LifecycleEvent::InputRequested {
