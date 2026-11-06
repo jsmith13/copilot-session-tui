@@ -1736,6 +1736,7 @@ fn handle_settings(app: &mut App, key: KeyCode) {
                 SettingsEditField::TerminalShell,
                 app.config.terminal.shell.clone().unwrap_or_default(),
             ),
+            24 => app.config.block_ctrl_z = !app.config.block_ctrl_z,
             9 => {
                 app.config.notifications.enabled = !app.config.notifications.enabled;
             }
@@ -3463,6 +3464,24 @@ mod tests {
             app.config.github_comment_filter,
             config::GithubCommentFilter::All
         );
+    }
+
+    #[test]
+    fn the_terminal_settings_offer_an_opt_in_control_z_block_that_can_be_turned_off() {
+        let mut app = App::new(Vec::new(), config::UserConfig::default());
+        app.disable_config_persistence();
+        app.mode = Mode::Settings;
+        app.settings_section = SettingsSection::Terminal;
+        app.settings_selected = 8;
+
+        handle_settings(&mut app, KeyCode::Down);
+        assert_eq!(app.settings_selected, 24);
+        assert!(!app.config.block_ctrl_z);
+
+        handle_settings(&mut app, KeyCode::Enter);
+        assert!(app.config.block_ctrl_z);
+        handle_settings(&mut app, KeyCode::Char(' '));
+        assert!(!app.config.block_ctrl_z);
     }
 
     #[test]

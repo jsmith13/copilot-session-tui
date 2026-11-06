@@ -1507,6 +1507,25 @@ pub fn draw_settings(f: &mut Frame, app: &mut App) {
     )));
 
     lines.push(Line::from(""));
+    setting_lines.push(lines.len());
+    lines.push(settings_row(
+        theme,
+        "Block Ctrl-Z",
+        if app.config.block_ctrl_z { "ON" } else { "OFF" },
+        if app.config.block_ctrl_z {
+            theme.success
+        } else {
+            theme.error
+        },
+        app.settings_selected == 24,
+        false,
+    ));
+    lines.push(Line::from(Span::styled(
+        "    Ignore Ctrl-Z in Copilot panes to prevent accidental suspension",
+        Style::default().fg(theme.muted),
+    )));
+
+    lines.push(Line::from(""));
     let terminal_end = lines.len();
     let notifications_start = lines.len();
     lines.push(Line::from(Span::styled(
@@ -2690,6 +2709,7 @@ mod help_tests {
             (SettingsSection::Terminal, 6, "Multiplexer"),
             (SettingsSection::Terminal, 7, "Mux Prefix"),
             (SettingsSection::Terminal, 8, "Terminal Shell"),
+            (SettingsSection::Terminal, 24, "Block Ctrl-Z"),
             (SettingsSection::Notifications, 9, "Notifications"),
             (SettingsSection::Notifications, 10, "ntfy Server"),
             (SettingsSection::Notifications, 11, "ntfy Topic"),

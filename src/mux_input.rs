@@ -871,7 +871,7 @@ fn execute_palette_command(app: &mut App, command: CommandId) {
             if let (Some(key), Some(pane)) =
                 (key, app.mux.as_mut().and_then(|mux| mux.focused_pane_mut()))
             {
-                if let Err(error) = pane.send_key(&key) {
+                if let Err(error) = pane.send_key(&key, app.config.block_ctrl_z) {
                     app.status_message = Some(format!("Cannot send prefix: {error}"));
                 }
             }
@@ -1109,7 +1109,7 @@ fn handle_attached_key(app: &mut App, key: KeyEvent) {
             // Noted before sending: a thread wake-up must not paste itself onto a
             // half-written message and submit the pair.
             pane.note_user_key(&key);
-            let _ = pane.send_key(&key);
+            let _ = pane.send_key(&key, app.config.block_ctrl_z);
         } else if matches!(
             key.code,
             crossterm::event::KeyCode::Enter | crossterm::event::KeyCode::Esc
@@ -4032,6 +4032,81 @@ mod tests {
         push_test_pane(&mut app, 1, session_id);
         app.view = View::Attached(1);
         app
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn changing_the_control_z_setting_immediately_changes_what_an_open_pane_receives() {
+        use std::time::{Duration, Instant};
+
+        let mut app = mux_app();
+        let events = app.mux.as_ref().unwrap().events.clone();
+        let pane = Pane::spawn(
+            PaneSpec {
+                id: 1,
+                title: "Ctrl-Z test".to_string(),
+                cwd: std::env::temp_dir(),
+                session_id: "control-z-toggle".to_string(),
+                program: "/bin/sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "stty raw -echo; printf 'ready\\n'; dd bs=1 count=3 2>/dev/null | od -An -tu1"
+                        .to_string(),
+                ],
+                events_path: None,
+                terminal_light_mode: Some(false),
+                hooks_active: false,
+            },
+            24,
+            80,
+            events,
+        )
+        .unwrap();
+        app.mux.as_mut().unwrap().push(pane);
+        app.view = View::Attached(1);
+        let contents = |app: &App| {
+            app.mux
+                .as_ref()
+                .unwrap()
+                .pane(1)
+                .unwrap()
+                .with_screen(|screen| screen.contents())
+                .unwrap()
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !contents(&app).contains("ready") {
+            assert!(Instant::now() < deadline, "the input reader never started");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let control_z = Event::Key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+        handle_attached_event(&mut app, control_z.clone());
+        app.config.block_ctrl_z = true;
+        handle_attached_event(&mut app, control_z.clone());
+        handle_attached_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE)),
+        );
+        app.config.block_ctrl_z = false;
+        handle_attached_event(&mut app, control_z);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let screen = contents(&app);
+            let received: Vec<_> = screen
+                .split_whitespace()
+                .filter_map(|word| word.parse::<u8>().ok())
+                .collect();
+            if received.len() == 3 {
+                assert_eq!(received, vec![0x1a, b'z', 0x1a]);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the child did not receive the expected input: {screen:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn push_test_pane(app: &mut App, id: u64, session_id: &str) {
@@ -7548,7 +7623,7 @@ fn main() {
             .unwrap()
             .contains("What's new")
         {
-            pane.send_key(&KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            pane.send_key(&KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), false)
                 .unwrap();
             let deadline = Instant::now() + Duration::from_secs(10);
             while Instant::now() < deadline {
@@ -7560,16 +7635,25 @@ fn main() {
             }
         }
         // `n` asks whether to start as-is or in a worktree; the second `n` answers.
-        pane.send_key(&KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
-            .unwrap();
+        pane.send_key(
+            &KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            false,
+        )
+        .unwrap();
         wait_for(&pane, &rx, "in the project as-is");
-        pane.send_key(&KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
-            .unwrap();
+        pane.send_key(
+            &KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            false,
+        )
+        .unwrap();
         wait_for(&pane, &rx, "FAKE COPILOT STARTED");
         wait_for(&pane, &rx, "exited with code 134");
         wait_for(&pane, &rx, "r restart");
-        pane.send_key(&KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE))
-            .unwrap();
+        pane.send_key(
+            &KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+            false,
+        )
+        .unwrap();
         wait_for(&pane, &rx, "FAKE COPILOT RESUMED");
 
         let invocations = std::fs::read_to_string(&log).unwrap();
@@ -7795,7 +7879,8 @@ fn main() {
         };
         let type_text = |pane: &mut Pane, text: &str| {
             for character in text.chars() {
-                pane.send_key(&key(KeyCode::Char(character))).unwrap();
+                pane.send_key(&key(KeyCode::Char(character)), false)
+                    .unwrap();
             }
         };
 
@@ -7807,7 +7892,7 @@ fn main() {
             .unwrap()
             .contains("What's new")
         {
-            pane.send_key(&key(KeyCode::Esc)).unwrap();
+            pane.send_key(&key(KeyCode::Esc), false).unwrap();
             wait_until(&pane, &rx, "What's new close", |screen| {
                 !screen.contents().contains("What's new")
             });
@@ -7816,12 +7901,12 @@ fn main() {
         // Resume each session from the list, coming back to it in between.
         for index in 0..sessions.len() {
             for _ in 0..sessions.len() {
-                pane.send_key(&key(KeyCode::Up)).unwrap();
+                pane.send_key(&key(KeyCode::Up), false).unwrap();
             }
             for _ in 0..index {
-                pane.send_key(&key(KeyCode::Down)).unwrap();
+                pane.send_key(&key(KeyCode::Down), false).unwrap();
             }
-            pane.send_key(&key(KeyCode::Enter)).unwrap();
+            pane.send_key(&key(KeyCode::Enter), false).unwrap();
             let deadline = Instant::now() + Duration::from_secs(30);
             while resumed(&log) <= index {
                 assert!(Instant::now() < deadline, "session {index} never resumed");
@@ -7831,16 +7916,16 @@ fn main() {
                 screen.contents().contains("FAKE COPILOT RESUMED")
             });
             if index + 1 < sessions.len() {
-                pane.send_key(&prefix).unwrap();
-                pane.send_key(&key(KeyCode::Char('d'))).unwrap();
+                pane.send_key(&prefix, false).unwrap();
+                pane.send_key(&key(KeyCode::Char('d')), false).unwrap();
                 wait_until(&pane, &rx, "the list again", |screen| {
                     !screen.contents().contains("FAKE COPILOT RESUMED")
                 });
             }
         }
 
-        pane.send_key(&prefix).unwrap();
-        pane.send_key(&key(KeyCode::Char('w'))).unwrap();
+        pane.send_key(&prefix, false).unwrap();
+        pane.send_key(&key(KeyCode::Char('w')), false).unwrap();
         wait_until(&pane, &rx, "the switcher with every session", |screen| {
             let rows = switcher(screen);
             sessions.iter().all(|(_, name, _)| shows(&rows, name))
@@ -7859,7 +7944,7 @@ fn main() {
 
         // x and q were commands here; now they are letters that match nothing.
         for _ in 0.."notes".len() {
-            pane.send_key(&key(KeyCode::Backspace)).unwrap();
+            pane.send_key(&key(KeyCode::Backspace), false).unwrap();
         }
         type_text(&mut pane, "xq");
         wait_until(&pane, &rx, "no matches", |screen| {
@@ -7869,15 +7954,15 @@ fn main() {
         show(&pane, "typed 'xq'");
 
         // Narrow by project rather than title, then open the match.
-        pane.send_key(&key(KeyCode::Backspace)).unwrap();
-        pane.send_key(&key(KeyCode::Backspace)).unwrap();
+        pane.send_key(&key(KeyCode::Backspace), false).unwrap();
+        pane.send_key(&key(KeyCode::Backspace), false).unwrap();
         type_text(&mut pane, "websi");
         wait_until(&pane, &rx, "only the website session", |screen| {
             let rows = switcher(screen);
             shows(&rows, "Polish landing page") && !shows(&rows, "Write release notes")
         });
         show(&pane, "typed 'websi'");
-        pane.send_key(&key(KeyCode::Enter)).unwrap();
+        pane.send_key(&key(KeyCode::Enter), false).unwrap();
         wait_until(&pane, &rx, "the website session attached", |screen| {
             screen
                 .contents()
@@ -7887,31 +7972,31 @@ fn main() {
         assert_eq!(resumed(&log), 3, "nothing was started or ended by typing");
 
         // Down moves within the matches; Delete closes the highlighted one.
-        pane.send_key(&prefix).unwrap();
-        pane.send_key(&key(KeyCode::Char('w'))).unwrap();
+        pane.send_key(&prefix, false).unwrap();
+        pane.send_key(&key(KeyCode::Char('w')), false).unwrap();
         type_text(&mut pane, "a");
-        pane.send_key(&key(KeyCode::Down)).unwrap();
+        pane.send_key(&key(KeyCode::Down), false).unwrap();
         wait_until(&pane, &rx, "the switcher filtered to 'a'", |screen| {
             shows(&switcher(screen), "Filter: a█")
         });
         show(&pane, "typed 'a', pressed Down");
-        pane.send_key(&key(KeyCode::Backspace)).unwrap();
+        pane.send_key(&key(KeyCode::Backspace), false).unwrap();
         type_text(&mut pane, "pay");
-        pane.send_key(&key(KeyCode::Delete)).unwrap();
+        pane.send_key(&key(KeyCode::Delete), false).unwrap();
         wait_until(&pane, &rx, "the payments session closed", |screen| {
             let rows = switcher(screen);
             shows(&rows, "Filter: pay") && shows(&rows, "No matching sessions")
         });
         show(&pane, "typed 'pay', pressed Delete");
 
-        pane.send_key(&key(KeyCode::Esc)).unwrap();
+        pane.send_key(&key(KeyCode::Esc), false).unwrap();
         // ESC followed at once by the prefix's 0x02 reads as one Alt+Ctrl+B, and the
         // switcher never sees an Esc at all; no person types them that close together.
         wait_until(&pane, &rx, "the switcher closed by Esc", |screen| {
             popup_rows(screen, "Sessions").is_none()
         });
-        pane.send_key(&prefix).unwrap();
-        pane.send_key(&key(KeyCode::Char('w'))).unwrap();
+        pane.send_key(&prefix, false).unwrap();
+        pane.send_key(&key(KeyCode::Char('w')), false).unwrap();
         wait_until(&pane, &rx, "two sessions left, unfiltered", |screen| {
             let rows = switcher(screen);
             shows(&rows, "Filter: █")
@@ -7922,8 +8007,8 @@ fn main() {
         show(&pane, "reopened after Esc");
 
         // Close the rest, so this CST leaves no workspace to recover.
-        pane.send_key(&key(KeyCode::Delete)).unwrap();
-        pane.send_key(&key(KeyCode::Delete)).unwrap();
+        pane.send_key(&key(KeyCode::Delete), false).unwrap();
+        pane.send_key(&key(KeyCode::Delete), false).unwrap();
         wait_until(
             &pane,
             &rx,

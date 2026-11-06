@@ -1136,7 +1136,7 @@ impl Pane {
         }
     }
 
-    pub fn send_key(&mut self, key: &KeyEvent) -> Result<()> {
+    pub fn send_key(&mut self, key: &KeyEvent, block_ctrl_z: bool) -> Result<()> {
         if !self.is_running() {
             return Ok(());
         }
@@ -1157,7 +1157,10 @@ impl Pane {
         } else {
             false
         };
-        if let (Some(bytes), Some(pty)) = (keys::encode(key, application_cursor), &mut self.pty) {
+        if let (Some(bytes), Some(pty)) = (
+            keys::encode(key, application_cursor, block_ctrl_z),
+            &mut self.pty,
+        ) {
             pty.write(&bytes)?;
         }
         Ok(())
@@ -1699,8 +1702,11 @@ mod tests {
         .unwrap();
         assert!(scrollback(&pane) > 0);
 
-        pane.send_key(&KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
-            .unwrap();
+        pane.send_key(
+            &KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            false,
+        )
+        .unwrap();
         assert_eq!(scrollback(&pane), 0);
         let _ = pane.shutdown();
     }
@@ -2841,8 +2847,11 @@ mod tests {
         wait_for_exit(&rx, &mut pane);
 
         // Must not error even though the child is gone.
-        pane.send_key(&KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
-            .unwrap();
+        pane.send_key(
+            &KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            false,
+        )
+        .unwrap();
         pane.send_paste("text").unwrap();
         assert!(pane.send_prompt_snippet("text").is_err());
     }
@@ -2976,10 +2985,10 @@ mod tests {
         // Give the shell time to draw its prompt before typing into it.
         std::thread::sleep(Duration::from_millis(1500));
         for ch in "echo round-trip".chars() {
-            pane.send_key(&KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+            pane.send_key(&KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), false)
                 .unwrap();
         }
-        pane.send_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        pane.send_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), false)
             .unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -3020,8 +3029,11 @@ mod tests {
         assert!(pane.is_running());
         assert!(pane.is_blank());
         assert!(!pane.is_launched());
-        pane.send_key(&KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
-            .unwrap();
+        pane.send_key(
+            &KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            false,
+        )
+        .unwrap();
         assert!(pane.send_prompt_snippet("wake up").is_err());
         pane.resize(30, 100).unwrap();
 

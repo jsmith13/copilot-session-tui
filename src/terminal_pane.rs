@@ -849,12 +849,14 @@ mod tests {
     fn key_encoding_preserves_shell_control_keys() {
         let control_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         let control_v = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL);
+        let control_z = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL);
         let alt_x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT);
         let meta_v = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::META);
         let shifted_up = KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT);
 
         assert_eq!(encode_key(control_c, false), Some(vec![3]));
         assert_eq!(encode_key(control_v, false), Some(vec![0x16]));
+        assert_eq!(encode_key(control_z, false), Some(vec![0x1a]));
         assert_eq!(encode_key(alt_x, false), Some(b"\x1bx".to_vec()));
         assert_eq!(encode_key(meta_v, false), Some(b"\x1bv".to_vec()));
         assert_eq!(encode_key(shifted_up, false), Some(b"\x1b[1;2A".to_vec()));

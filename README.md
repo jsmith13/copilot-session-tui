@@ -721,6 +721,11 @@ used deliberately: they are the class of key terminals deliver most reliably, wh
 partially implements. If a prefix does not seem to reach CST, run `cst debug-keys` to see
 exactly what your terminal sends.
 
+**Global Settings → Terminal → Block Ctrl-Z** ignores `Ctrl-Z` in Copilot panes to
+prevent accidental suspension. It is off by default (`"block_ctrl_z": false` in
+`config.json`) and applies immediately to open panes. Scratchpad and snippet-editor
+undo and shell-terminal job control are unaffected.
+
 ## Agent threads
 
 One agent files an issue asking another for something. The second answers, gets to work,
