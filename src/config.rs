@@ -176,6 +176,9 @@ pub struct UserConfig {
     pub mux_prefix: String,
 
     #[serde(default)]
+    pub block_ctrl_z: bool,
+
+    #[serde(default)]
     pub tmux_keys: TmuxKeyConfig,
 
     #[serde(default)]
@@ -398,6 +401,7 @@ impl Default for UserConfig {
             github_comment_filter: GithubCommentFilter::All,
             mux: true,
             mux_prefix: default_mux_prefix(),
+            block_ctrl_z: false,
             tmux_keys: TmuxKeyConfig::default(),
             worktree: WorktreeConfig::default(),
             terminal: TerminalConfig::default(),
@@ -1195,6 +1199,23 @@ mod tests {
             loaded.github_comment_filter,
             GithubCommentFilter::Unresolved
         );
+    }
+
+    #[test]
+    fn blocking_control_z_is_opt_in_for_old_configs_and_survives_saving() {
+        let mut config: UserConfig = serde_json::from_str("{}").unwrap();
+        assert!(!config.block_ctrl_z);
+        assert!(!UserConfig::default().block_ctrl_z);
+
+        config.block_ctrl_z = true;
+        let json = serde_json::to_string(&config).unwrap();
+        let loaded: UserConfig = serde_json::from_str(&json).unwrap();
+        assert!(loaded.block_ctrl_z);
+
+        config.block_ctrl_z = false;
+        let json = serde_json::to_string(&config).unwrap();
+        let loaded: UserConfig = serde_json::from_str(&json).unwrap();
+        assert!(!loaded.block_ctrl_z);
     }
 
     #[test]

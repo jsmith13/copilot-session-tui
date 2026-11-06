@@ -360,7 +360,7 @@ impl SettingsSection {
             Self::General => &[0, 1, 2, 18, 3],
             Self::Filters => &[16, 17, 19],
             Self::Worktrees => &[4, 5],
-            Self::Terminal => &[6, 7, 8],
+            Self::Terminal => &[6, 7, 8, 24],
             Self::Notifications => &[9, 10, 11, 12, 13, 14, 15],
             // Numbered after everything else rather than renumbering: the indices are
             // keys, not positions.
@@ -4834,10 +4834,13 @@ impl App {
             anyhow::bail!("the session is no longer open");
         };
         pane.send_prompt_snippet(&pointer)?;
-        pane.send_key(&crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Enter,
-            crossterm::event::KeyModifiers::NONE,
-        ))?;
+        pane.send_key(
+            &crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            self.config.block_ctrl_z,
+        )?;
         // Pressing Enter is not the same as the message being taken. Copilot leaves it in
         // the composer while it is busy in a way the hooks do not report — an autopilot
         // run working through background agents, say. The composer counts as occupied

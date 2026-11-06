@@ -6,10 +6,10 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 /// a child process we have to reverse that translation. `application_cursor` selects
 /// between the normal (`CSI A`) and application (`SS3 A`) cursor-key encodings, which
 /// full-screen programs switch on via DECCKM.
-pub fn encode(key: &KeyEvent, application_cursor: bool) -> Option<Vec<u8>> {
+pub fn encode(key: &KeyEvent, application_cursor: bool, block_ctrl_z: bool) -> Option<Vec<u8>> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     // Ctrl+Z suspends Copilot instead of undoing, leaving its pane unresponsive.
-    if ctrl && matches!(key.code, KeyCode::Char('z' | 'Z')) {
+    if block_ctrl_z && ctrl && matches!(key.code, KeyCode::Char('z' | 'Z')) {
         return None;
     }
     let alt = key
@@ -279,9 +279,12 @@ mod tests {
 
     #[test]
     fn plain_characters_are_utf8() {
-        assert_eq!(encode(&key(KeyCode::Char('a')), false).unwrap(), b"a");
         assert_eq!(
-            encode(&key(KeyCode::Char('é')), false).unwrap(),
+            encode(&key(KeyCode::Char('a')), false, false).unwrap(),
+            b"a"
+        );
+        assert_eq!(
+            encode(&key(KeyCode::Char('é')), false, false).unwrap(),
             "é".as_bytes()
         );
     }
@@ -289,26 +292,26 @@ mod tests {
     #[test]
     fn control_characters_map_to_c0_bytes() {
         let ctrl_b = key_with(KeyCode::Char('b'), KeyModifiers::CONTROL);
-        assert_eq!(encode(&ctrl_b, false).unwrap(), vec![0x02]);
+        assert_eq!(encode(&ctrl_b, false, false).unwrap(), vec![0x02]);
 
         let ctrl_c = key_with(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert_eq!(encode(&ctrl_c, false).unwrap(), vec![0x03]);
+        assert_eq!(encode(&ctrl_c, false, false).unwrap(), vec![0x03]);
 
         let ctrl_v = key_with(KeyCode::Char('v'), KeyModifiers::CONTROL);
-        assert_eq!(encode(&ctrl_v, false).unwrap(), vec![0x16]);
+        assert_eq!(encode(&ctrl_v, false, false).unwrap(), vec![0x16]);
 
         let ctrl_space = key_with(KeyCode::Char(' '), KeyModifiers::CONTROL);
-        assert_eq!(encode(&ctrl_space, false).unwrap(), vec![0x00]);
+        assert_eq!(encode(&ctrl_space, false, false).unwrap(), vec![0x00]);
     }
 
     #[test]
     fn uppercase_control_matches_lowercase() {
         let upper = key_with(KeyCode::Char('B'), KeyModifiers::CONTROL);
-        assert_eq!(encode(&upper, false).unwrap(), vec![0x02]);
+        assert_eq!(encode(&upper, false, false).unwrap(), vec![0x02]);
     }
 
     #[test]
-    fn control_z_is_not_forwarded_so_an_undo_habit_cannot_suspend_copilot() {
+    fn control_z_is_blocked_only_when_the_user_opts_in_to_preventing_suspension() {
         for character in ['z', 'Z'] {
             for modifiers in [
                 KeyModifiers::CONTROL,
@@ -318,49 +321,66 @@ mod tests {
                 KeyModifiers::CONTROL | KeyModifiers::SUPER,
             ] {
                 let key = key_with(KeyCode::Char(character), modifiers);
-                assert_eq!(encode(&key, false), None);
+                assert_eq!(encode(&key, false, true), None);
+                let expected = if modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::META | KeyModifiers::SUPER)
+                {
+                    vec![0x1b, 0x1a]
+                } else {
+                    vec![0x1a]
+                };
+                assert_eq!(encode(&key, false, false), Some(expected));
             }
         }
     }
 
     #[test]
     fn z_without_control_still_reaches_copilot_for_typing_and_shortcuts() {
-        assert_eq!(encode(&key(KeyCode::Char('z')), false).unwrap(), b"z");
+        assert_eq!(encode(&key(KeyCode::Char('z')), false, true).unwrap(), b"z");
         let upper = key_with(KeyCode::Char('Z'), KeyModifiers::SHIFT);
-        assert_eq!(encode(&upper, false).unwrap(), b"Z");
+        assert_eq!(encode(&upper, false, true).unwrap(), b"Z");
         let alt_z = key_with(KeyCode::Char('z'), KeyModifiers::ALT);
-        assert_eq!(encode(&alt_z, false).unwrap(), b"\x1bz");
+        assert_eq!(encode(&alt_z, false, true).unwrap(), b"\x1bz");
     }
 
     #[test]
     fn alt_prefixes_escape() {
         let alt_x = key_with(KeyCode::Char('x'), KeyModifiers::ALT);
-        assert_eq!(encode(&alt_x, false).unwrap(), vec![0x1b, b'x']);
+        assert_eq!(encode(&alt_x, false, false).unwrap(), vec![0x1b, b'x']);
     }
 
     #[test]
     fn cursor_keys_respect_application_mode() {
-        assert_eq!(encode(&key(KeyCode::Up), false).unwrap(), b"\x1b[A");
-        assert_eq!(encode(&key(KeyCode::Up), true).unwrap(), b"\x1bOA");
-        assert_eq!(encode(&key(KeyCode::Left), false).unwrap(), b"\x1b[D");
+        assert_eq!(encode(&key(KeyCode::Up), false, false).unwrap(), b"\x1b[A");
+        assert_eq!(encode(&key(KeyCode::Up), true, false).unwrap(), b"\x1bOA");
+        assert_eq!(
+            encode(&key(KeyCode::Left), false, false).unwrap(),
+            b"\x1b[D"
+        );
     }
 
     #[test]
     fn modified_cursor_keys_use_csi_with_parameters() {
         let ctrl_right = key_with(KeyCode::Right, KeyModifiers::CONTROL);
         // Application mode must not win over the modified form.
-        assert_eq!(encode(&ctrl_right, true).unwrap(), b"\x1b[1;5C");
+        assert_eq!(encode(&ctrl_right, true, false).unwrap(), b"\x1b[1;5C");
 
         let shift_up = key_with(KeyCode::Up, KeyModifiers::SHIFT);
-        assert_eq!(encode(&shift_up, false).unwrap(), b"\x1b[1;2A");
+        assert_eq!(encode(&shift_up, false, false).unwrap(), b"\x1b[1;2A");
     }
 
     #[test]
     fn editing_keys_use_tilde_sequences() {
-        assert_eq!(encode(&key(KeyCode::Delete), false).unwrap(), b"\x1b[3~");
-        assert_eq!(encode(&key(KeyCode::PageUp), false).unwrap(), b"\x1b[5~");
+        assert_eq!(
+            encode(&key(KeyCode::Delete), false, false).unwrap(),
+            b"\x1b[3~"
+        );
+        assert_eq!(
+            encode(&key(KeyCode::PageUp), false, false).unwrap(),
+            b"\x1b[5~"
+        );
         let ctrl_delete = key_with(KeyCode::Delete, KeyModifiers::CONTROL);
-        assert_eq!(encode(&ctrl_delete, false).unwrap(), b"\x1b[3;5~");
+        assert_eq!(encode(&ctrl_delete, false, false).unwrap(), b"\x1b[3;5~");
     }
 
     /// Both routes a terminal can take to Ctrl+J have to reach the child as LF.
@@ -371,38 +391,56 @@ mod tests {
     #[test]
     fn ctrl_j_inserts_a_newline_however_the_terminal_reports_it() {
         let as_char = key_with(KeyCode::Char('j'), KeyModifiers::CONTROL);
-        assert_eq!(encode(&as_char, false).unwrap(), b"\n");
+        assert_eq!(encode(&as_char, false, false).unwrap(), b"\n");
 
         let as_ctrl_enter = key_with(KeyCode::Enter, KeyModifiers::CONTROL);
-        assert_eq!(encode(&as_ctrl_enter, false).unwrap(), b"\n");
+        assert_eq!(encode(&as_ctrl_enter, false, false).unwrap(), b"\n");
 
         // A plain Enter must still submit.
-        assert_eq!(encode(&key(KeyCode::Enter), false).unwrap(), b"\r");
+        assert_eq!(encode(&key(KeyCode::Enter), false, false).unwrap(), b"\r");
     }
 
     #[test]
     fn enter_tab_backspace_and_escape() {
-        assert_eq!(encode(&key(KeyCode::Enter), false).unwrap(), b"\r");
-        assert_eq!(encode(&key(KeyCode::Tab), false).unwrap(), b"\t");
-        assert_eq!(encode(&key(KeyCode::Backspace), false).unwrap(), vec![0x7f]);
-        assert_eq!(encode(&key(KeyCode::Esc), false).unwrap(), vec![0x1b]);
-        assert_eq!(encode(&key(KeyCode::BackTab), false).unwrap(), b"\x1b[Z");
+        assert_eq!(encode(&key(KeyCode::Enter), false, false).unwrap(), b"\r");
+        assert_eq!(encode(&key(KeyCode::Tab), false, false).unwrap(), b"\t");
+        assert_eq!(
+            encode(&key(KeyCode::Backspace), false, false).unwrap(),
+            vec![0x7f]
+        );
+        assert_eq!(
+            encode(&key(KeyCode::Esc), false, false).unwrap(),
+            vec![0x1b]
+        );
+        assert_eq!(
+            encode(&key(KeyCode::BackTab), false, false).unwrap(),
+            b"\x1b[Z"
+        );
     }
 
     #[test]
     fn function_keys_split_between_ss3_and_csi() {
-        assert_eq!(encode(&key(KeyCode::F(1)), false).unwrap(), b"\x1bOP");
-        assert_eq!(encode(&key(KeyCode::F(5)), false).unwrap(), b"\x1b[15~");
-        assert_eq!(encode(&key(KeyCode::F(12)), false).unwrap(), b"\x1b[24~");
+        assert_eq!(
+            encode(&key(KeyCode::F(1)), false, false).unwrap(),
+            b"\x1bOP"
+        );
+        assert_eq!(
+            encode(&key(KeyCode::F(5)), false, false).unwrap(),
+            b"\x1b[15~"
+        );
+        assert_eq!(
+            encode(&key(KeyCode::F(12)), false, false).unwrap(),
+            b"\x1b[24~"
+        );
         let shift_f1 = key_with(KeyCode::F(1), KeyModifiers::SHIFT);
-        assert_eq!(encode(&shift_f1, false).unwrap(), b"\x1b[11;2~");
+        assert_eq!(encode(&shift_f1, false, false).unwrap(), b"\x1b[11;2~");
     }
 
     #[test]
     fn unsupported_keys_are_dropped() {
-        assert!(encode(&key(KeyCode::F(20)), false).is_none());
+        assert!(encode(&key(KeyCode::F(20)), false, false).is_none());
         let ctrl_digit = key_with(KeyCode::Char('5'), KeyModifiers::CONTROL);
-        assert!(encode(&ctrl_digit, false).is_none());
+        assert!(encode(&ctrl_digit, false, false).is_none());
     }
 
     #[test]
