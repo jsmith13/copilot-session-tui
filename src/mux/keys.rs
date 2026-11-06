@@ -8,6 +8,10 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 /// full-screen programs switch on via DECCKM.
 pub fn encode(key: &KeyEvent, application_cursor: bool) -> Option<Vec<u8>> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    // Ctrl+Z suspends Copilot instead of undoing, leaving its pane unresponsive.
+    if ctrl && matches!(key.code, KeyCode::Char('z' | 'Z')) {
+        return None;
+    }
     let alt = key
         .modifiers
         .intersects(KeyModifiers::ALT | KeyModifiers::META | KeyModifiers::SUPER);
@@ -301,6 +305,31 @@ mod tests {
     fn uppercase_control_matches_lowercase() {
         let upper = key_with(KeyCode::Char('B'), KeyModifiers::CONTROL);
         assert_eq!(encode(&upper, false).unwrap(), vec![0x02]);
+    }
+
+    #[test]
+    fn control_z_is_not_forwarded_so_an_undo_habit_cannot_suspend_copilot() {
+        for character in ['z', 'Z'] {
+            for modifiers in [
+                KeyModifiers::CONTROL,
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+                KeyModifiers::CONTROL | KeyModifiers::META,
+                KeyModifiers::CONTROL | KeyModifiers::SUPER,
+            ] {
+                let key = key_with(KeyCode::Char(character), modifiers);
+                assert_eq!(encode(&key, false), None);
+            }
+        }
+    }
+
+    #[test]
+    fn z_without_control_still_reaches_copilot_for_typing_and_shortcuts() {
+        assert_eq!(encode(&key(KeyCode::Char('z')), false).unwrap(), b"z");
+        let upper = key_with(KeyCode::Char('Z'), KeyModifiers::SHIFT);
+        assert_eq!(encode(&upper, false).unwrap(), b"Z");
+        let alt_z = key_with(KeyCode::Char('z'), KeyModifiers::ALT);
+        assert_eq!(encode(&alt_z, false).unwrap(), b"\x1bz");
     }
 
     #[test]
